@@ -7,6 +7,8 @@ CXX := $(NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-andro
 LD  := clang++
 LIBS_PATH := -L$(PROJECT_ROOT)third_party/libs
 LDFLAGS := -shared $(LIBS_PATH) -landroid -llog -lvulkan -lopenxr_loader
+GLSLCFLAGS :=
+GLSLC := glslc
 
 # =========================
 # Project structure
@@ -15,6 +17,10 @@ SRC_DIR := src
 OBJ_DIR := build
 SRC := $(wildcard $(SRC_DIR)/*.cpp)
 OBJ := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SRC))
+
+SHADER_OBJ_DIR := $(OBJ_DIR)/assets
+COMP_SHADERS_SRC := $(wildcard $(SRC_DIR)/*.comp)
+COMP_SHADERS_OBJ := $(patsubst $(SRC_DIR)/%.comp,$(SHADER_OBJ_DIR)/%.spv,$(COMP_SHADERS_SRC))
 TARGET := libengine.so
 
 # =========================
@@ -45,7 +51,7 @@ all: debug
 # =========================
 # Debug
 debug: CXXFLAGS := $(COMMON_FLAGS) $(DEBUG_FLAGS)
-debug: $(OBJ_DIR) $(OBJ)
+debug: $(OBJ_DIR) $(SHADER_OBJ_DIR) $(OBJ) $(COMP_SHADERS_OBJ) 
 	$(CXX) $(OBJ) -o ./build/libengine_debug.so $(LDFLAGS)
 
 # Release
@@ -59,12 +65,17 @@ release: $(OBJ_DIR) $(OBJ)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(SHADER_OBJ_DIR)/%.spv: $(SRC_DIR)/%.comp
+	$(GLSLC) $(GLSLCFLAGS) -c $< -o $@
+
 # =========================
 # Build directory
 # =========================
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
+$(SHADER_OBJ_DIR):
+	mkdir -p $(SHADER_OBJ_DIR)
 # =========================
 # Clean
 # =========================

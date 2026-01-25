@@ -19,6 +19,7 @@
 #include <chrono>
 #include <thread>
 #include <unistd.h>
+#include <errno.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "vryume", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "vryume", __VA_ARGS__)
 
@@ -38,6 +39,8 @@ struct Swapchain {
   XrSwapchain xr_swapchain;
   XrSwapchainImageVulkan2KHR *images;
   uint32_t image_count;
+  VkDescriptorSet *descriptor_sets; // one per image
+  VkImageView *image_views;         // one per image
 };
 
 static XrInstance instance;
@@ -53,14 +56,14 @@ static uint32_t viewCount;
 static XrViewConfigurationView *viewConfigurations;
 static Swapchain *color_swapchains;
 static Swapchain *depth_swapchains;
-static VkImage *storageImage;
-static VkDeviceMemory *storageMemory;
-static VkFence fence_exec;
+static VkFence *fence_exec; // one per view
 static VkCommandBuffer *command_buffers;
 static XrCompositionLayerDepthInfoKHR *composition_layer_depth_info;
 static XrCompositionLayerProjectionView *composition_layer_projection_views;
 static XrView *views;
 static XrSpace xr_space_stage;
+static VkPipelineLayout pipelineLayout;
+static VkPipeline computePipeline;
 
 static bool is_xr_session_running = false;
 static bool should_run_framecycle = false;
@@ -171,7 +174,7 @@ uint32_t tick() {
   }
 
   if (!should_run_framecycle) {
-    usleep(16); // hack to not spin while session stopped
+    usleep(100); // hack to not spin while session stopped
     return 0;
   }
 
@@ -188,22 +191,6 @@ uint32_t tick() {
     return 0;
   }
 
-  XrViewState view_state = {
-      .type = XR_TYPE_VIEW_STATE,
-  };
-  XrViewLocateInfo view_locate_info = {
-      .type = XR_TYPE_VIEW_LOCATE_INFO,
-      .viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-      .displayTime = frame_state.predictedDisplayTime,
-      .space = xr_space_stage,
-  };
-
-  uint32_t _out_view_count;
-  for (uint32_t i = 0; i < viewCount; i++) {
-    views[i].type = XR_TYPE_VIEW;
-  }
-  CHECK_XR(xrLocateViews(session, &view_locate_info, &view_state, viewCount,
-                         &_out_view_count, views));
   // should we ? assert(_out_view_count == viewCount);
 
   XrFrameBeginInfo frame_begin_info = {
@@ -211,8 +198,9 @@ uint32_t tick() {
   };
   CHECK_XR(xrBeginFrame(session, &frame_begin_info));
 
-  CHECK_VK(vkWaitForFences(vkDevice, 1, &fence_exec, VK_TRUE, UINT64_MAX));
-  CHECK_VK(vkResetFences(vkDevice, 1, &fence_exec));
+  CHECK_VK(
+      vkWaitForFences(vkDevice, viewCount, fence_exec, VK_TRUE, UINT64_MAX));
+  CHECK_VK(vkResetFences(vkDevice, viewCount, fence_exec));
   CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
 
   VkCommandBufferAllocateInfo allocInfo{};
@@ -223,30 +211,44 @@ uint32_t tick() {
 
   CHECK_VK(vkAllocateCommandBuffers(vkDevice, &allocInfo, command_buffers));
 
+  // views
+  {
+    XrViewState view_state = {
+        .type = XR_TYPE_VIEW_STATE,
+    };
+    XrViewLocateInfo view_locate_info = {
+        .type = XR_TYPE_VIEW_LOCATE_INFO,
+        .viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+        .displayTime = frame_state.predictedDisplayTime,
+        .space = xr_space_stage,
+    };
+
+    uint32_t _out_view_count;
+    for (uint32_t i = 0; i < viewCount; i++) {
+      views[i].type = XR_TYPE_VIEW;
+    }
+
+    CHECK_XR(xrLocateViews(session, &view_locate_info, &view_state, viewCount,
+                           &_out_view_count, views));
+  }
+
   for (uint32_t i = 0; i < viewCount; i++) {
-    uint32_t aquired_image_index = 0;
+    uint32_t aquired_color_image_index = 0;
+    uint32_t aquired_depth_image_index = 0;
     XrSwapchainImageAcquireInfo swapchain_image_acquire_info = {
         .type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO,
     };
     // xrAcquireSwapchainImage call only gives us the index of the image
-    // we will render to, for recording commands we still neeed to call
-    // xrWaitSwapchainImage before submitting graphics commands that
+    // we will render to, for the purpose of recording commands. we still neeed
+    // to call xrWaitSwapchainImage before submitting graphics commands that
     // write to the image.
     CHECK_XR(xrAcquireSwapchainImage(color_swapchains[i].xr_swapchain,
                                      &swapchain_image_acquire_info,
-                                     &aquired_image_index));
+                                     &aquired_color_image_index));
 
-    XrSwapchainImageWaitInfo swapchain_image_wait_info = {
-        .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
-        .timeout = XR_INFINITE_DURATION,
-    };
-    CHECK_XR(xrWaitSwapchainImage(color_swapchains[i].xr_swapchain,
-                                  &swapchain_image_wait_info));
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK_VK(vkBeginCommandBuffer(command_buffers[i], &beginInfo));
+    CHECK_XR(xrAcquireSwapchainImage(depth_swapchains[i].xr_swapchain,
+                                     &swapchain_image_acquire_info,
+                                     &aquired_depth_image_index));
 
     auto view_image_extent = VkExtent3D{
         .width = viewConfigurations[i].recommendedImageRectWidth,
@@ -254,104 +256,30 @@ uint32_t tick() {
         .depth = 1,
     };
 
-    {
-      VkImageMemoryBarrier barriers[1] = {
-          {
-              .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-              .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-              .dstAccessMask =
-                  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-              .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-              .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-              .image = storageImage[i],
-              .subresourceRange =
-                  {
-                      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                      .levelCount = 1,
-                      .layerCount = 1,
-                  },
-          },
-      };
+    VkCommandBufferBeginInfo beginInfo{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    CHECK_VK(vkBeginCommandBuffer(command_buffers[i], &beginInfo));
 
-      vkCmdPipelineBarrier(command_buffers[i],
-                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
-                           0, nullptr, 1, barriers);
+    vkCmdBindPipeline(command_buffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
+                      computePipeline);
 
-      VkClearColorValue color = {
-          .float32 = {1.0f, 1.0f, 0.0f, 1.0f}}; // RGBA = Red
-      VkImageSubresourceRange range = {
-          .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-          .baseMipLevel = 0,
-          .levelCount = 1,
-          .baseArrayLayer = 0,
-          .layerCount = 1,
-      };
+    VkDescriptorSet sets[2] = {
+        color_swapchains[i].descriptor_sets[aquired_color_image_index],
+        depth_swapchains[i].descriptor_sets[aquired_depth_image_index]};
 
-      vkCmdClearColorImage(command_buffers[i], storageImage[i],
-                           VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
-    }
+    vkCmdBindDescriptorSets(command_buffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipelineLayout,
+                            0, // firstSet
+                            2, // setCount
+                            sets, 0, nullptr);
 
-    // TODO: check the access masks and stages, we are going to start
-    // reusing the same storage image as last frame as soon as the
-    // submited buffers trigger the fence
-    VkImageMemoryBarrier barriers[2] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = 0,
-            .dstAccessMask =
-                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .image = storageImage[i],
-            .subresourceRange =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .levelCount = 1,
-                    .layerCount = 1,
-                },
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = 0,
-            .dstAccessMask =
-                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .image = color_swapchains[i].images[aquired_image_index].image,
-            .subresourceRange =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .levelCount = 1,
-                    .layerCount = 1,
-                },
-        }};
-
-    vkCmdPipelineBarrier(command_buffers[i], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 2, barriers);
-
-    VkImageCopy region{};
-    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.srcSubresource.layerCount = 1;
-    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.dstSubresource.layerCount = 1;
-    region.extent = view_image_extent;
-
-    vkCmdCopyImage(command_buffers[i], storageImage[i],
-                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   color_swapchains[i].images[aquired_image_index].image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    // TODO: we should do the same thing about the depth
+    vkCmdDispatch(command_buffers[i],
+                  viewConfigurations[i].recommendedImageRectWidth / 16,
+                  viewConfigurations[i].recommendedImageRectHeight / 16, 1);
 
     CHECK_VK(vkEndCommandBuffer(command_buffers[i]));
-
-    XrSwapchainImageReleaseInfo swapchain_image_release_info = {
-        .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO,
-    };
-    CHECK_XR(xrReleaseSwapchainImage(color_swapchains[i].xr_swapchain,
-                                     &swapchain_image_release_info));
 
     composition_layer_depth_info[i] = (XrCompositionLayerDepthInfoKHR){
         .type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR,
@@ -369,8 +297,7 @@ uint32_t tick() {
     };
     composition_layer_projection_views[i] = {
         .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-        //.next = &composition_layer_depth_info[i],
-        .next = nullptr,
+        .next = &composition_layer_depth_info[i],
         .pose = views[i].pose,
         .fov = views[i].fov,
         .subImage =
@@ -386,12 +313,39 @@ uint32_t tick() {
     };
   }
 
-  VkSubmitInfo submit_info = {
-      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-      .commandBufferCount = viewCount,
-      .pCommandBuffers = command_buffers,
-  };
-  CHECK_VK(vkQueueSubmit(vkQueue, 1, &submit_info, fence_exec));
+  for (uint32_t i = 0; i < viewCount; i++) {
+    XrSwapchainImageWaitInfo color_swapchain_image_wait_info = {
+        .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+        .timeout = XR_INFINITE_DURATION,
+    };
+    CHECK_XR(xrWaitSwapchainImage(color_swapchains[i].xr_swapchain,
+                                  &color_swapchain_image_wait_info));
+
+    XrSwapchainImageWaitInfo depth_swapchain_image_wait_info = {
+        .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+        .timeout = XR_INFINITE_DURATION,
+    };
+    CHECK_XR(xrWaitSwapchainImage(depth_swapchains[i].xr_swapchain,
+                                  &depth_swapchain_image_wait_info));
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &command_buffers[i],
+    };
+    CHECK_VK(vkQueueSubmit(vkQueue, 1, &submit_info, fence_exec[i]));
+
+    XrSwapchainImageReleaseInfo color_swapchain_image_release_info = {
+        .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO,
+    };
+    CHECK_XR(xrReleaseSwapchainImage(color_swapchains[i].xr_swapchain,
+                                     &color_swapchain_image_release_info));
+
+    XrSwapchainImageReleaseInfo depth_swapchain_image_release_info = {
+        .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO,
+    };
+    CHECK_XR(xrReleaseSwapchainImage(depth_swapchains[i].xr_swapchain,
+                                     &depth_swapchain_image_release_info));
+  }
 
   XrCompositionLayerProjection composition_layer_projection = {
       .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
@@ -662,16 +616,21 @@ extern "C" int engine_main(
         instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
         viewCount, &viewCount, viewConfigurations));
 
+    for (uint32_t i = 0; i < viewCount; i++) {
+      LOGI("view[%d]: %d x %d", i,
+           viewConfigurations[i].recommendedImageRectWidth,
+           viewConfigurations[i].recommendedImageRectHeight);
+    }
     LOGI("xrEnumerateViewConfigurationViews returned %u", viewCount);
   }
 
   color_swapchains = (Swapchain *)malloc(sizeof(Swapchain) * viewCount);
   for (uint32_t i = 0; i < viewCount; i++) {
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
                                XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
                                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-    swapchainInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+    swapchainInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
     swapchainInfo.sampleCount =
         viewConfigurations[i].recommendedSwapchainSampleCount;
     swapchainInfo.width = viewConfigurations[i].recommendedImageRectWidth;
@@ -686,8 +645,14 @@ extern "C" int engine_main(
     CHECK_XR(xrEnumerateSwapchainImages(color_swapchains[i].xr_swapchain, 0,
                                         &color_swapchains[i].image_count,
                                         nullptr));
+
     color_swapchains[i].images = (XrSwapchainImageVulkan2KHR *)malloc(
         sizeof(XrSwapchainImageVulkan2KHR) * color_swapchains[i].image_count);
+    color_swapchains[i].image_views = (VkImageView *)malloc(
+        sizeof(VkImageView) * color_swapchains[i].image_count);
+    color_swapchains[i].descriptor_sets = (VkDescriptorSet *)malloc(
+        sizeof(VkDescriptorSet) * color_swapchains[i].image_count);
+
     for (uint32_t j = 0; j < color_swapchains[i].image_count; j++) {
       color_swapchains[i].images[j] = {.type =
                                            XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR};
@@ -698,6 +663,34 @@ extern "C" int engine_main(
         color_swapchains[i].xr_swapchain, color_swapchains[i].image_count,
         &_swapchain_image_count,
         (XrSwapchainImageBaseHeader *)color_swapchains[i].images));
+
+    for (uint32_t j = 0; j < color_swapchains[i].image_count; j++) {
+      VkImageViewCreateInfo viewInfo = {
+          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+          .flags = 0,
+          .image = color_swapchains[i].images[j].image,
+          .viewType = VK_IMAGE_VIEW_TYPE_2D,
+          .format = VK_FORMAT_R8G8B8A8_UNORM,
+          .components =
+              {
+                  .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                  .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                  .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                  .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+              },
+          .subresourceRange =
+              {
+                  .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                  .baseMipLevel = 0,
+                  .levelCount = 1,
+                  .baseArrayLayer = 0,
+                  .layerCount = 1,
+              },
+      };
+
+      CHECK_VK(vkCreateImageView(vkDevice, &viewInfo, nullptr,
+                                 &color_swapchains[i].image_views[j]));
+    }
   }
 
   depth_swapchains = (Swapchain *)malloc(sizeof(Swapchain) * viewCount);
@@ -725,6 +718,11 @@ extern "C" int engine_main(
                                         nullptr));
     depth_swapchains[i].images = (XrSwapchainImageVulkan2KHR *)malloc(
         sizeof(XrSwapchainImageVulkan2KHR) * depth_swapchains[i].image_count);
+    depth_swapchains[i].image_views = (VkImageView *)malloc(
+        sizeof(VkImageView) * depth_swapchains[i].image_count);
+    depth_swapchains[i].descriptor_sets = (VkDescriptorSet *)malloc(
+        sizeof(VkDescriptorSet) * depth_swapchains[i].image_count);
+
     for (uint32_t j = 0; j < depth_swapchains[i].image_count; j++) {
       depth_swapchains[i].images[j] = {.type =
                                            XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR};
@@ -735,75 +733,45 @@ extern "C" int engine_main(
         depth_swapchains[i].xr_swapchain, depth_swapchains[i].image_count,
         &_swapchain_image_count,
         (XrSwapchainImageBaseHeader *)depth_swapchains[i].images));
-  }
 
-  // create a storage image per view
-  storageImage = (VkImage *)malloc(sizeof(VkImage) * viewCount);
-  storageMemory = (VkDeviceMemory *)malloc(sizeof(VkDeviceMemory) * viewCount);
-  for (uint32_t i = 0; i < viewCount; i++) {
-    // Choose format you want for the storage image
-    VkFormat imageFormat =
-        VK_FORMAT_R8G8B8A8_SRGB; // TODO: this is a compatible format just to
-                                 // test
+    for (uint32_t j = 0; j < depth_swapchains[i].image_count; j++) {
+      VkImageViewCreateInfo viewInfo = {
+          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+          .flags = 0,
+          .image = depth_swapchains[i].images[j].image,
+          .viewType = VK_IMAGE_VIEW_TYPE_2D,
+          .format = VK_FORMAT_D16_UNORM,
+          .components =
+              {
+                  .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                  .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                  .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                  .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+              },
 
-    // Create the image
-    auto extent = VkExtent3D{
-        .width = viewConfigurations[i].recommendedImageRectWidth,
-        .height = viewConfigurations[i].recommendedImageRectHeight,
-        .depth = 1,
-    };
-    VkImageCreateInfo imgInfo{};
-    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imgInfo.imageType = VK_IMAGE_TYPE_2D;
-    imgInfo.format = imageFormat;
-    imgInfo.extent = extent;
-    imgInfo.mipLevels = 1;
-    imgInfo.arrayLayers = 1;
-    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imgInfo.usage = // VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                    // // TODO: we need storage and maybe sampled
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+          .subresourceRange =
+              {
+                  .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                  .baseMipLevel = 0,
+                  .levelCount = 1,
+                  .baseArrayLayer = 0,
+                  .layerCount = 1,
+              },
+      };
 
-    CHECK_VK(vkCreateImage(vkDevice, &imgInfo, nullptr, &storageImage[i]));
-
-    VkMemoryRequirements memReq;
-    vkGetImageMemoryRequirements(vkDevice, storageImage[i], &memReq);
-
-    // Find device-local memory type index
-    uint32_t memoryTypeIndex = 0;
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(vkPhysicalDevice, &memProps);
-
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-      if ((memReq.memoryTypeBits & (1 << i)) &&
-          (memProps.memoryTypes[i].propertyFlags &
-           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-        memoryTypeIndex = i;
-        break;
-      }
+      CHECK_VK(vkCreateImageView(vkDevice, &viewInfo, nullptr,
+                                 &depth_swapchains[i].image_views[j]));
     }
-
-    VkMemoryAllocateInfo image_mem_info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = memReq.size,
-        .memoryTypeIndex = memoryTypeIndex,
-    };
-
-    LOGI("image_mem_info: %p", &image_mem_info);
-
-    CHECK_VK(vkAllocateMemory(vkDevice, &image_mem_info, nullptr,
-                              &storageMemory[i]));
-    CHECK_VK(vkBindImageMemory(vkDevice, storageImage[i], storageMemory[i], 0));
   }
 
-  {
+  fence_exec = (VkFence *)malloc(sizeof(VkFence) * viewCount);
+  for (uint32_t i = 0; i < viewCount; i++) {
     VkFenceCreateInfo fence_create_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .flags = VK_FENCE_CREATE_SIGNALED_BIT,
     };
-    CHECK_VK(vkCreateFence(vkDevice, &fence_create_info, nullptr, &fence_exec));
+    CHECK_VK(
+        vkCreateFence(vkDevice, &fence_create_info, nullptr, &fence_exec[i]));
   }
 
   command_buffers =
@@ -814,6 +782,195 @@ extern "C" int engine_main(
       (XrCompositionLayerProjectionView *)malloc(
           sizeof(XrCompositionLayerProjectionView) * viewCount);
   views = (XrView *)malloc(sizeof(XrView) * viewCount);
+
+  // pipelineLayout
+  VkDescriptorSetLayout color_descriptor_set_layout;
+  VkDescriptorSetLayout depth_descriptor_set_layout;
+  {
+
+    VkDescriptorSetLayoutBinding color_image_binding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .pImmutableSamplers = NULL};
+
+    VkDescriptorSetLayoutCreateInfo colorDescriptorSetLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &color_image_binding};
+
+    CHECK_VK(vkCreateDescriptorSetLayout(vkDevice,
+                                         &colorDescriptorSetLayoutInfo, nullptr,
+                                         &color_descriptor_set_layout));
+
+    VkDescriptorSetLayoutBinding depth_image_binding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .pImmutableSamplers = NULL};
+
+    VkDescriptorSetLayoutCreateInfo depthDescriptorSetLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &depth_image_binding};
+
+    CHECK_VK(vkCreateDescriptorSetLayout(vkDevice,
+                                         &depthDescriptorSetLayoutInfo, nullptr,
+                                         &depth_descriptor_set_layout));
+
+    VkDescriptorSetLayout set_layouts[] = {color_descriptor_set_layout,
+                                           depth_descriptor_set_layout};
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 2,
+        .pSetLayouts = set_layouts,
+        .pushConstantRangeCount = 0,
+        .pPushConstantRanges = nullptr};
+
+    CHECK_VK(vkCreatePipelineLayout(vkDevice, &pipelineLayoutInfo, NULL,
+                                    &pipelineLayout));
+  }
+
+  // computePipeline
+  {
+    VkShaderModule shaderModule;
+    {
+      // TODO: this is not proper android, we should get the data folder path
+      // from an api
+      FILE *f = fopen(
+          "/data/user/0/com.kadhem.vryume/files/assets/main.glsl.spv", "rb");
+      if (!f) {
+        LOGE("Error opening file: %s\n", strerror(errno));
+        return 1;
+      }
+
+      fseek(f, 0, SEEK_END);
+      size_t size = ftell(f);
+      rewind(f);
+
+      uint32_t *code = (uint32_t *)malloc(size);
+      fread(code, 1, size, f);
+      fclose(f);
+
+      VkShaderModuleCreateInfo shaderModuleInfo = {
+          .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+          .codeSize = size,
+          .pCode = code};
+
+      CHECK_VK(vkCreateShaderModule(vkDevice, &shaderModuleInfo, NULL,
+                                    &shaderModule));
+
+      free(code);
+    }
+
+    VkPipelineShaderStageCreateInfo stageInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shaderModule,
+        .pName = "main"};
+
+    VkComputePipelineCreateInfo pipelineInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = stageInfo,
+        .layout = pipelineLayout};
+
+    CHECK_VK(vkCreateComputePipelines(vkDevice, VK_NULL_HANDLE, 1,
+                                      &pipelineInfo, NULL, &computePipeline));
+  }
+
+  // descriptor allocation and update
+  {
+    uint32_t total_color_swapchain_image_count = 0;
+    uint32_t total_depth_swapchain_image_count = 0;
+
+    for (int i = 0; i < viewCount; i++) {
+      total_color_swapchain_image_count += color_swapchains[i].image_count;
+      total_depth_swapchain_image_count += depth_swapchains[i].image_count;
+    }
+
+    uint32_t descriptor_count =
+        total_color_swapchain_image_count + total_depth_swapchain_image_count;
+
+    VkDescriptorPoolSize poolSize = {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                     .descriptorCount = descriptor_count};
+
+    VkDescriptorPoolCreateInfo poolInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = descriptor_count, // one descriptor per set
+        .poolSizeCount = 1,
+        .pPoolSizes = &poolSize};
+
+    VkDescriptorPool descriptorPool;
+    CHECK_VK(
+        vkCreateDescriptorPool(vkDevice, &poolInfo, NULL, &descriptorPool));
+
+    for (uint32_t i = 0; i < viewCount; i++) {
+      for (uint32_t j = 0; j < color_swapchains[i].image_count; j++) {
+        VkDescriptorSetAllocateInfo allocInfo = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = descriptorPool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &color_descriptor_set_layout};
+
+        VkDescriptorSet descriptorSet;
+        CHECK_VK(
+            vkAllocateDescriptorSets(vkDevice, &allocInfo, &descriptorSet));
+
+        VkDescriptorImageInfo imageInfo = {
+            .sampler = VK_NULL_HANDLE,
+            .imageView = color_swapchains[i].image_views[j],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+
+        VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptorSet,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &imageInfo};
+
+        vkUpdateDescriptorSets(vkDevice, 1, &write, 0, nullptr);
+
+        color_swapchains[i].descriptor_sets[j] = descriptorSet;
+      }
+    }
+    for (uint32_t i = 0; i < viewCount; i++) {
+      for (uint32_t j = 0; j < depth_swapchains[i].image_count; j++) {
+        VkDescriptorSetAllocateInfo allocInfo = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = descriptorPool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &depth_descriptor_set_layout};
+
+        VkDescriptorSet descriptorSet;
+        CHECK_VK(
+            vkAllocateDescriptorSets(vkDevice, &allocInfo, &descriptorSet));
+
+        VkDescriptorImageInfo imageInfo = {
+            .sampler = VK_NULL_HANDLE,
+            .imageView = depth_swapchains[i].image_views[j],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL // we will write this from
+                                                   // the shader direclty
+        };
+
+        VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptorSet,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &imageInfo};
+
+        vkUpdateDescriptorSets(vkDevice, 1, &write, 0, nullptr);
+        depth_swapchains[i].descriptor_sets[j] = descriptorSet;
+      }
+    }
+  }
 
   while (!*android_requests_exit) {
     tick();

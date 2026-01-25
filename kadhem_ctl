@@ -32,6 +32,9 @@ function install
     adb push "./build/libengine_debug.so" "/data/local/tmp/libengine.so"; or return
     adb shell run-as $package "cp /data/local/tmp/libengine.so files/"; or return
     adb shell run-as $package "chmod 755 files/libengine.so"; or return
+    
+    adb push "./build/assets/" "/data/local/tmp/"; or return
+    adb shell run-as $package "cp -R /data/local/tmp/assets files/"; or return
 end
 
 function run

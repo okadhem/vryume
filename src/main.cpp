@@ -5,10 +5,13 @@
 #include <iterator>
 #include <malloc.h>
 #include <vulkan/vulkan_core.h>
-#define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_VULKAN
+
+#ifdef XR_USE_PLATFORM_ANDROID
 #include <android/log.h>
 #include <jni.h>
+#endif
+
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h> // needs to be after vulkan and android stuff
 #include <openxr/openxr_platform.h>
@@ -20,8 +23,17 @@
 #include <thread>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
+#include <string.h>
+#include <inttypes.h>
+
+#ifdef XR_USE_PLATFORM_ANDROID
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "vryume", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "vryume", __VA_ARGS__)
+#else
+#define LOGI(...) printf(__VA_ARGS__)
+#define LOGE(...) printf(__VA_ARGS__)
+#endif
 
 #define CHECK_VK(x)                                                            \
   if ((x) != VK_SUCCESS) {                                                     \
@@ -64,12 +76,16 @@ static XrView *views;
 static XrSpace xr_space_stage;
 static VkPipelineLayout pipelineLayout;
 static VkPipeline computePipeline;
+static VkFormat color_swapchain_format =
+    VK_FORMAT_R8G8B8A8_SRGB; // TODO: we should have the same result as
+                             // VK_FORMAT_R8G8B8A8_UNORM but we don't
+static VkFormat depth_swapchain_format = VK_FORMAT_D16_UNORM;
 
 static bool is_xr_session_running = false;
 static bool should_run_framecycle = false;
 uint32_t tick() {
 
-  XrEventDataBuffer xr_event_buffer{XR_TYPE_EVENT_DATA_BUFFER};
+  XrEventDataBuffer xr_event_buffer{.type = XR_TYPE_EVENT_DATA_BUFFER};
   XrResult result = xrPollEvent(instance, &xr_event_buffer);
   while (result == XR_SUCCESS) {
     switch (xr_event_buffer.type) {
@@ -170,6 +186,7 @@ uint32_t tick() {
     }
     }
 
+    xr_event_buffer = {.type = XR_TYPE_EVENT_DATA_BUFFER};
     result = xrPollEvent(instance, &xr_event_buffer);
   }
 
@@ -262,6 +279,73 @@ uint32_t tick() {
     };
     CHECK_VK(vkBeginCommandBuffer(command_buffers[i], &beginInfo));
 
+    // vkCmdPipelineBarrier2
+    {
+      VkImageMemoryBarrier2 barriers[] = {
+          {
+              .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+              .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+              .srcAccessMask = VK_ACCESS_2_NONE,
+
+              .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+              .dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+
+              .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+              .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+              .image =
+                  color_swapchains[i].images[aquired_color_image_index].image,
+
+              .subresourceRange =
+                  {
+                      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                      .baseMipLevel = 0,
+                      .levelCount = 1,
+                      .baseArrayLayer = 0,
+                      .layerCount = 1,
+                  },
+          },
+          {
+              .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+              .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+              .srcAccessMask = VK_ACCESS_2_NONE,
+
+              .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+              .dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+
+              .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+              .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+              .image =
+                  depth_swapchains[i].images[aquired_depth_image_index].image,
+
+              .subresourceRange =
+                  {
+                      .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                      .baseMipLevel = 0,
+                      .levelCount = 1,
+                      .baseArrayLayer = 0,
+                      .layerCount = 1,
+                  },
+          }};
+
+      VkDependencyInfo depInfo = {
+          .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+          .imageMemoryBarrierCount = 2,
+          .pImageMemoryBarriers = barriers,
+      };
+
+      // vkCmdPipelineBarrier2(command_buffers[i], &depInfo);
+    }
+
     vkCmdBindPipeline(command_buffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
                       computePipeline);
 
@@ -278,6 +362,100 @@ uint32_t tick() {
     vkCmdDispatch(command_buffers[i],
                   viewConfigurations[i].recommendedImageRectWidth / 16,
                   viewConfigurations[i].recommendedImageRectHeight / 16, 1);
+
+    //    VkImageMemoryBarrier barrier = {
+    //        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+    //        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+    //        .dstAccessMask = 0,
+    //        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+    //        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    //        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    //        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    //        .image =
+    //        color_swapchains[i].images[aquired_color_image_index].image,
+    //        .subresourceRange =
+    //            {
+    //                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    //                .baseMipLevel = 0,
+    //                .levelCount = 1,
+    //                .baseArrayLayer = 0,
+    //                .layerCount = 1,
+    //            },
+    //    };
+    //
+    //    vkCmdPipelineBarrier(
+    //        command_buffers[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    //        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1,
+    //        &barrier);
+    //
+    //
+
+    // vkCmdPipelineBarrier2
+    {
+      VkImageMemoryBarrier2 barriers[] = {
+          {
+              .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+              .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+              .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+
+              .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+              .dstAccessMask = VK_ACCESS_2_NONE,
+
+              .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+              .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+
+              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+              .image =
+                  color_swapchains[i].images[aquired_color_image_index].image,
+
+              .subresourceRange =
+                  {
+                      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                      .baseMipLevel = 0,
+                      .levelCount = 1,
+                      .baseArrayLayer = 0,
+                      .layerCount = 1,
+                  },
+          },
+          {
+              .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+              .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+              .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+
+              .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+              .dstAccessMask = VK_ACCESS_2_NONE,
+
+              .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+              .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+
+              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+              .image =
+                  depth_swapchains[i].images[aquired_depth_image_index].image,
+
+              .subresourceRange =
+                  {
+                      .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                      .baseMipLevel = 0,
+                      .levelCount = 1,
+                      .baseArrayLayer = 0,
+                      .layerCount = 1,
+                  },
+          }};
+
+      VkDependencyInfo depInfo = {
+          .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+          .imageMemoryBarrierCount = 2,
+          .pImageMemoryBarriers = barriers,
+      };
+
+      // vkCmdPipelineBarrier2(command_buffers[i], &depInfo);
+    }
 
     CHECK_VK(vkEndCommandBuffer(command_buffers[i]));
 
@@ -369,12 +547,23 @@ uint32_t tick() {
   return 0;
 }
 
+XrBool32 XRAPI_PTR openxrDebugCallback(
+    XrDebugUtilsMessageSeverityFlagsEXT severity,
+    XrDebugUtilsMessageTypeFlagsEXT types,
+    const XrDebugUtilsMessengerCallbackDataEXT *data, void *userData) {
+  fprintf(stderr, "OpenXR: %s\n", data->message);
+  return XR_FALSE;
+}
+
 extern "C" int engine_main(
+#ifdef XR_USE_PLATFORM_ANDROID
     JavaVM *jvm, jobject main_activity,
-    bool *android_requests_exit // android app received "destory" lifecycle //
+    bool *android_requests_exit // android app received "destory" lifecycle,
                                 // TODO, this should be an atomic of some sort
+#endif
 ) {
-  LOGI("Message from inside engine_main 7");
+  LOGI("Message from inside engine_main");
+#ifdef XR_USE_PLATFORM_ANDROID
 
   LOGI("called with jvm=%p, main_activity=%p\n", (void *)jvm,
        (void *)main_activity);
@@ -388,10 +577,13 @@ extern "C" int engine_main(
       .next = NULL,
       .applicationVM = jvm,
       .applicationContext = main_activity};
+
   xrInitializeLoaderKHR((const XrLoaderInitInfoBaseHeaderKHR *)&loaderInitInfo);
+#endif
 
   // instance
   {
+#ifdef XR_USE_PLATFORM_ANDROID
     XrInstanceCreateInfoAndroidKHR androidInfo = {
         .type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR,
         .applicationVM = jvm,
@@ -403,6 +595,8 @@ extern "C" int engine_main(
         XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
         XR_EXT_DEBUG_UTILS_EXTENSION_NAME,
     };
+    const char *layers[] = {"XR_APILAYER_LUNARG_core_validation"};
+
     XrInstanceCreateInfo instanceCreateInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     snprintf(instanceCreateInfo.applicationInfo.applicationName, 128, "VRYume");
     instanceCreateInfo.applicationInfo.applicationVersion = 1;
@@ -411,9 +605,57 @@ extern "C" int engine_main(
     instanceCreateInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     instanceCreateInfo.enabledExtensionCount = 4;
     instanceCreateInfo.enabledExtensionNames = extensions;
+    instanceCreateInfo.enabledApiLayerCount = 1;
+    instanceCreateInfo.enabledApiLayerNames = layers;
     instanceCreateInfo.next = &androidInfo;
+#else
+    const char *extensions[] = {
+        XR_EXT_LOCAL_FLOOR_EXTENSION_NAME,
+        XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
+        XR_EXT_DEBUG_UTILS_EXTENSION_NAME,
+    };
+    const char *layers[] = {"XR_APILAYER_LUNARG_core_validation"};
+
+    XrInstanceCreateInfo instanceCreateInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+    snprintf(instanceCreateInfo.applicationInfo.applicationName, 128, "VRYume");
+    instanceCreateInfo.applicationInfo.applicationVersion = 1;
+    snprintf(instanceCreateInfo.applicationInfo.engineName, 128, "NoEngine");
+    instanceCreateInfo.applicationInfo.engineVersion = 1;
+    instanceCreateInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    instanceCreateInfo.enabledExtensionCount = 3;
+    instanceCreateInfo.enabledExtensionNames = extensions;
+    instanceCreateInfo.enabledApiLayerCount = 1;
+    instanceCreateInfo.enabledApiLayerNames = layers;
+#endif
 
     CHECK_XR(xrCreateInstance(&instanceCreateInfo, &instance));
+  }
+
+  {
+    XrDebugUtilsMessengerCreateInfoEXT debugInfo{};
+    debugInfo.type = XR_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+
+    debugInfo.messageSeverities =
+        XR_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+        XR_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+        XR_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+        XR_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+
+    debugInfo.messageTypes = XR_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                             XR_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                             XR_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT |
+                             XR_DEBUG_UTILS_MESSAGE_TYPE_CONFORMANCE_BIT_EXT;
+
+    debugInfo.userCallback = &openxrDebugCallback;
+    debugInfo.userData = nullptr;
+
+    PFN_xrCreateDebugUtilsMessengerEXT xrCreateDebugUtilsMessengerEXT = nullptr;
+    xrGetInstanceProcAddr(
+        instance, "xrCreateDebugUtilsMessengerEXT",
+        (PFN_xrVoidFunction *)&xrCreateDebugUtilsMessengerEXT);
+
+    XrDebugUtilsMessengerEXT messenger;
+    xrCreateDebugUtilsMessengerEXT(instance, &debugInfo, &messenger);
   }
 
   // systemId
@@ -444,16 +686,14 @@ extern "C" int engine_main(
   }
 
   {
-    const char *instExts[] = {
-        "VK_KHR_surface",
-        "VK_KHR_android_surface" // Needed on Quest/Android
-    };
-
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "VRYume",
         .apiVersion = VK_API_VERSION_1_1,
     };
+
+#ifdef XR_USE_PLATFORM_ANDROID
+    const char *instExts[] = {"VK_KHR_surface", "VK_KHR_android_surface"};
 
     VkInstanceCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -461,6 +701,12 @@ extern "C" int engine_main(
         .enabledExtensionCount = 2,
         .ppEnabledExtensionNames = instExts,
     };
+#else
+    VkInstanceCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &app,
+    };
+#endif
 
     XrVulkanInstanceCreateInfoKHR xr_vulkan_instance_create_info = {
         .type = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR,
@@ -526,12 +772,12 @@ extern "C" int engine_main(
         .pQueuePriorities = &priority,
     };
 
-    const char *devExts[] = {"VK_KHR_swapchain"}; // required for XR swapchains
+    const char *devExts[] = {"VK_KHR_swapchain", "VK_KHR_synchronization2"};
 
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                               .queueCreateInfoCount = 1,
                               .pQueueCreateInfos = &qci,
-                              .enabledExtensionCount = 1,
+                              .enabledExtensionCount = 2,
                               .ppEnabledExtensionNames = devExts};
 
     PFN_xrCreateVulkanDeviceKHR xrCreateVulkanDeviceKHR;
@@ -624,13 +870,31 @@ extern "C" int engine_main(
     LOGI("xrEnumerateViewConfigurationViews returned %u", viewCount);
   }
 
+  {
+
+    uint32_t format_count = 0;
+
+    CHECK_XR(xrEnumerateSwapchainFormats(session, 0, &format_count, NULL));
+
+    int64_t *formats = (int64_t *)malloc(sizeof(int64_t) * format_count);
+
+    CHECK_XR(xrEnumerateSwapchainFormats(session, format_count, &format_count,
+                                         formats));
+
+    printf("Supported OpenXR swapchain formats:\n");
+    for (uint32_t i = 0; i < format_count; ++i) {
+      printf("  VkFormat = %" PRId64 "\n", formats[i]);
+    }
+
+    free(formats);
+  }
+
   color_swapchains = (Swapchain *)malloc(sizeof(Swapchain) * viewCount);
   for (uint32_t i = 0; i < viewCount; i++) {
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
-                               XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-                               XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-    swapchainInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
+    swapchainInfo.format = color_swapchain_format;
+
     swapchainInfo.sampleCount =
         viewConfigurations[i].recommendedSwapchainSampleCount;
     swapchainInfo.width = viewConfigurations[i].recommendedImageRectWidth;
@@ -670,7 +934,7 @@ extern "C" int engine_main(
           .flags = 0,
           .image = color_swapchains[i].images[j].image,
           .viewType = VK_IMAGE_VIEW_TYPE_2D,
-          .format = VK_FORMAT_R8G8B8A8_UNORM,
+          .format = color_swapchain_format,
           .components =
               {
                   .r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -700,9 +964,7 @@ extern "C" int engine_main(
         .usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                       XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                       XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
-        .format =
-            VK_FORMAT_D16_UNORM, // TODO: we are assuming this will be
-                                 // supported, but the we should test that.
+        .format = depth_swapchain_format,
         .sampleCount = viewConfigurations[i].recommendedSwapchainSampleCount,
         .width = viewConfigurations[i].recommendedImageRectWidth,
         .height = viewConfigurations[i].recommendedImageRectHeight,
@@ -740,7 +1002,7 @@ extern "C" int engine_main(
           .flags = 0,
           .image = depth_swapchains[i].images[j].image,
           .viewType = VK_IMAGE_VIEW_TYPE_2D,
-          .format = VK_FORMAT_D16_UNORM,
+          .format = depth_swapchain_format,
           .components =
               {
                   .r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -838,10 +1100,15 @@ extern "C" int engine_main(
   {
     VkShaderModule shaderModule;
     {
+
+#ifdef XR_USE_PLATFORM_ANDROID
       // TODO: this is not proper android, we should get the data folder path
       // from an api
       FILE *f = fopen(
           "/data/user/0/com.kadhem.vryume/files/assets/main.glsl.spv", "rb");
+#else
+      FILE *f = fopen("./build/assets/main.glsl.spv", "rb");
+#endif
       if (!f) {
         LOGE("Error opening file: %s\n", strerror(errno));
         return 1;
@@ -972,7 +1239,11 @@ extern "C" int engine_main(
     }
   }
 
+#ifdef XR_USE_PLATFORM_ANDROID
   while (!*android_requests_exit) {
+#else
+  while (true) {
+#endif
     tick();
   }
 
@@ -991,5 +1262,10 @@ extern "C" int engine_main(
 
   LOGI("Cleaned up!\n");
 
+  return 0;
+}
+
+int main() {
+  engine_main();
   return 0;
 }

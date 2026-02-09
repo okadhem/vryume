@@ -30,6 +30,7 @@ end
 
 function install
     adb push "./build/libengine_debug.so" "/data/local/tmp/libengine.so"; or return
+    adb shell run-as $package "mkdir -p files"; or return
     adb shell run-as $package "cp /data/local/tmp/libengine.so files/"; or return
     adb shell run-as $package "chmod 755 files/libengine.so"; or return
     
@@ -50,7 +51,7 @@ end
 
 
 function run_lldb_server
-    set local_symbols "/home/kadhem/Documents/Unreal Projects/VRUnrealTemplate/Binaries/Android/VRUnrealTemplate-arm64.so"
+    set local_symbols "./build/libengine_debug.so"
 
 
     set awk_find_unused_port '{
@@ -69,22 +70,22 @@ function run_lldb_server
     adb forward tcp:$platform_port tcp:$platform_port
     adb forward tcp:$gdbserver_port tcp:$gdbserver_port
 
-    adb shell run-as "com.kadhem.VRUnrealTemplate test -d ./lldb"
+    adb shell run-as "$package test -d ./lldb"
     if test $status -ne 0 
-        adb shell run-as "com.kadhem.VRUnrealTemplate mkdir -p lldb/bin/"
-        adb shell run-as "com.kadhem.VRUnrealTemplate cp /data/local/tmp/lldb-server ./lldb/bin/"
+        adb shell run-as "$package mkdir -p lldb/bin/"
+        adb shell run-as "$package cp /data/local/tmp/lldb-server ./lldb/bin/"
     end
    
     adb shell run-as "$package pkill -9 lldb-server"
     adb shell run-as "$package ./lldb/bin/lldb-server platform --server --listen *:$platform_port" &
-    adb shell run-as "$package ./lldb/bin/lldb-server gdbserver  *:$gdbserver_port" &
+    adb shell run-as "$package ./lldb/bin/lldb-server gdbserver  127.0.0.1:$gdbserver_port" &
     
     set main_pid (adb shell run-as $package "pidof $package" | awk '{print $1}')
     
-    set maps_line (adb shell run-as $package "cat /proc/$main_pid/maps | grep libUnreal.so | head -n 1")
+    set maps_line (adb shell run-as $package "cat /proc/$main_pid/maps | grep libengine.so | head -n 1")
     
     if test -z "$maps_line"
-        echo "No libUnreal.so mapping found!"
+        echo "No libengine_debug.so mapping found!"
         exit 1
     end
 
@@ -96,7 +97,7 @@ function run_lldb_server
     # we assuming /proc/maps will be sorted by vitual address, thus the line we got should start 
     # at the file begining, if not we will not have the correct mapping to slide the module later
     if test "$offset" != "00000000"
-        echo "ERROR: libUnreal.so offset in /proc/maps is non-zero: $offset"
+        echo "ERROR: libengine_debug.so offset in /proc/maps is non-zero: $offset"
     end
 
     set outfile "lldb_attach_generated"

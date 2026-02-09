@@ -3,10 +3,18 @@ PROJECT_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # =========================
 # Compiler & Linker
 # =========================
-CXX := $(NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang
+# for android
+#CXX := $(NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang
+#LD  := clang++
+#LIBS_PATH := -L$(PROJECT_ROOT)third_party/libs
+#LDFLAGS := -shared $(LIBS_PATH) -landroid -llog -lvulkan -lopenxr_loader
+
+# for desktop build
+CXX := clang++
 LD  := clang++
 LIBS_PATH := -L$(PROJECT_ROOT)third_party/libs
-LDFLAGS := -shared $(LIBS_PATH) -landroid -llog -lvulkan -lopenxr_loader
+LDFLAGS := $(LIBS_PATH) -lvulkan -lopenxr_loader
+
 GLSLCFLAGS :=
 GLSLC := glslc
 
@@ -33,6 +41,7 @@ COMMON_FLAGS := -std=c++20 \
                 -nostdlib++ \
                 -fPIC \
 				-x c++ \
+				-fno-omit-frame-pointer \
 				$(INCLUDES_PATH)
 
 # =========================
@@ -50,9 +59,14 @@ all: debug
 # Build rules
 # =========================
 # Debug
+#debug: CXXFLAGS := $(COMMON_FLAGS) $(DEBUG_FLAGS)
+#debug: $(OBJ_DIR) $(SHADER_OBJ_DIR) $(OBJ) $(COMP_SHADERS_OBJ) 
+#	$(CXX) $(OBJ) -o ./build/libengine_debug.so $(LDFLAGS)
+
 debug: CXXFLAGS := $(COMMON_FLAGS) $(DEBUG_FLAGS)
 debug: $(OBJ_DIR) $(SHADER_OBJ_DIR) $(OBJ) $(COMP_SHADERS_OBJ) 
-	$(CXX) $(OBJ) -o ./build/libengine_debug.so $(LDFLAGS)
+	$(CXX) $(OBJ) -o ./build/game_exe $(LDFLAGS)
+
 
 # Release
 release: CXXFLAGS := $(COMMON_FLAGS) $(RELEASE_FLAGS)

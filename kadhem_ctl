@@ -42,7 +42,7 @@ function run
     if adb shell run-as $package "pkill vryume"
         echo "Info: killed running vryume process"
     end
-    make; or return
+    make android_debug; or return
     install; or return
     adb shell "am start -n com.kadhem.vryume/.MainActivity"; or return
     echo "Running: logcat -s vryume"; or return

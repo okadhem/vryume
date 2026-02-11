@@ -595,7 +595,7 @@ extern "C" int engine_main(
         XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
         XR_EXT_DEBUG_UTILS_EXTENSION_NAME,
     };
-    const char *layers[] = {"XR_APILAYER_LUNARG_core_validation"};
+    // const char *layers[] = {"XR_APILAYER_LUNARG_core_validation"};
 
     XrInstanceCreateInfo instanceCreateInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     snprintf(instanceCreateInfo.applicationInfo.applicationName, 128, "VRYume");
@@ -605,8 +605,8 @@ extern "C" int engine_main(
     instanceCreateInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     instanceCreateInfo.enabledExtensionCount = 4;
     instanceCreateInfo.enabledExtensionNames = extensions;
-    instanceCreateInfo.enabledApiLayerCount = 1;
-    instanceCreateInfo.enabledApiLayerNames = layers;
+    // instanceCreateInfo.enabledApiLayerCount = 1;
+    // instanceCreateInfo.enabledApiLayerNames = layers;
     instanceCreateInfo.next = &androidInfo;
 #else
     const char *extensions[] = {
@@ -1265,7 +1265,9 @@ extern "C" int engine_main(
   return 0;
 }
 
+#ifndef XR_USE_PLATFORM_ANDROID
 int main() {
   engine_main();
   return 0;
 }
+#endif

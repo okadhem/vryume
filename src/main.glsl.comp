@@ -16,7 +16,7 @@ layout(
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
-    imageStore(color_image, coord, vec4(1.0, 1.0, 0.0, 1.0));
+    imageStore(color_image, coord, vec4(0.0, 1.0, 1.0, 1.0));
     //imageStore(color_image, coord, vec4(0.5, 0.5, 0.5, 1.0));
     imageStore(depth_image, coord, vec4(0.0, 0.0, 0.0, 0.0));  // only x matters, 0 is near plane
 }

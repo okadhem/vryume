@@ -2,6 +2,7 @@
 // adb shell setprop debug.oculus.loadandinjectpackagedvvl.com.kadhem.vryume 1
 // adb shell setprop debug.vvl.forcelayerlog 1
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <malloc.h>
 #include <vulkan/vulkan_core.h>
@@ -76,10 +77,10 @@ static XrView *views;
 static XrSpace xr_space_stage;
 static VkPipelineLayout pipelineLayout;
 static VkPipeline computePipeline;
-static VkFormat color_swapchain_format =
-    VK_FORMAT_R8G8B8A8_SRGB; // TODO: we should have the same result as
-                             // VK_FORMAT_R8G8B8A8_UNORM but we don't
-static VkFormat depth_swapchain_format = VK_FORMAT_D16_UNORM;
+static VkFormat color_swapchain_format = VK_FORMAT_R8G8B8A8_UNORM;
+static VkFormat depth_swapchain_format =
+    VK_FORMAT_D16_UNORM; // TODO: this is likely broken we need to test properly
+static PFN_vkCmdPipelineBarrier2KHR loaded_vkCmdPipelineBarrier2;
 
 static bool is_xr_session_running = false;
 static bool should_run_framecycle = false;
@@ -88,21 +89,21 @@ uint32_t tick() {
   XrEventDataBuffer xr_event_buffer{.type = XR_TYPE_EVENT_DATA_BUFFER};
   XrResult result = xrPollEvent(instance, &xr_event_buffer);
   while (result == XR_SUCCESS) {
+    LOGI("event loop iter\n");
     switch (xr_event_buffer.type) {
 
     case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
       XrEventDataSessionStateChanged *pxr_session_state_changed =
           reinterpret_cast<XrEventDataSessionStateChanged *>(&xr_event_buffer);
       if (pxr_session_state_changed->session != session) {
-        LOGE("[XrProgram] Received session state changed for unknown "
-             "session?!");
+        LOGE("Unkown session\n");
         break;
       }
 
       switch (pxr_session_state_changed->state) {
       case XR_SESSION_STATE_IDLE:
       case XR_SESSION_STATE_UNKNOWN: {
-        LOGI("OpenXr state: UNKNOWN");
+        LOGI("OpenXr state: UNKNOWN\n");
         should_run_framecycle = false;
         break;
       }
@@ -110,15 +111,15 @@ uint32_t tick() {
       case XR_SESSION_STATE_FOCUSED:
       case XR_SESSION_STATE_SYNCHRONIZED:
       case XR_SESSION_STATE_VISIBLE: {
-        LOGI("OpenXr state: FOCUSED | SYNCHRONIZED | VISIBLE");
+        LOGI("OpenXr state: FOCUSED | SYNCHRONIZED | VISIBLE\n");
         should_run_framecycle = true;
         break;
       }
 
       case XR_SESSION_STATE_READY: {
-        LOGI("OpenXr state: READY");
+        LOGI("OpenXr state: READY\n");
         if (!is_xr_session_running) {
-          LOGI("Begining Xr Session");
+          LOGI("Begining Xr Session\n");
           XrSessionBeginInfo xr_session_begin_info = {
               .type = XR_TYPE_SESSION_BEGIN_INFO,
               .primaryViewConfigurationType =
@@ -132,9 +133,9 @@ uint32_t tick() {
       }
 
       case XR_SESSION_STATE_STOPPING: {
-        LOGI("OpenXr state: STOPPING");
+        LOGI("OpenXr state: STOPPING\n");
         if (is_xr_session_running) {
-          LOGI("calling xrEndSession");
+          LOGI("calling xrEndSession\n");
           CHECK_XR(xrEndSession(session));
           is_xr_session_running = false;
         }
@@ -146,7 +147,7 @@ uint32_t tick() {
       case XR_SESSION_STATE_LOSS_PENDING:
       case XR_SESSION_STATE_EXITING: {
         assert(!is_xr_session_running);
-        LOGI("calling xrDestroySession");
+        LOGI("calling xrDestroySession\n");
         CHECK_XR(xrDestroySession(session));
 
         should_run_framecycle = false;
@@ -166,7 +167,7 @@ uint32_t tick() {
     case XR_TYPE_EVENT_DATA_EVENTS_LOST: {
       auto *p_events_lost =
           reinterpret_cast<XrEventDataEventsLost *>(&xr_event_buffer);
-      LOGE("[XrProgram] EVENTS_LOST: Lost events: %i",
+      LOGE("[XrProgram] EVENTS_LOST: Lost events: %i\n",
            p_events_lost->lostEventCount);
       break;
     }
@@ -181,7 +182,7 @@ uint32_t tick() {
     }
 
     default: {
-      LOGE("Unhandled event type: %u", xr_event_buffer.type);
+      LOGE("Unhandled event type: %u\n", xr_event_buffer.type);
       break;
     }
     }
@@ -203,9 +204,10 @@ uint32_t tick() {
     CHECK_XR(xrWaitFrame(session, &frame_wait_info, &frame_state));
   }
 
+  // TODO
   if (!frame_state.shouldRender) {
-    LOGI("frame_state.shouldRender is false");
-    return 0;
+    LOGI("frame_state.shouldRender is false\n");
+    //   return 0;
   }
 
   // should we ? assert(_out_view_count == viewCount);
@@ -242,7 +244,7 @@ uint32_t tick() {
 
     uint32_t _out_view_count;
     for (uint32_t i = 0; i < viewCount; i++) {
-      views[i].type = XR_TYPE_VIEW;
+      views[i] = {.type = XR_TYPE_VIEW};
     }
 
     CHECK_XR(xrLocateViews(session, &view_locate_info, &view_state, viewCount,
@@ -343,7 +345,7 @@ uint32_t tick() {
           .pImageMemoryBarriers = barriers,
       };
 
-      // vkCmdPipelineBarrier2(command_buffers[i], &depInfo);
+      loaded_vkCmdPipelineBarrier2(command_buffers[i], &depInfo);
     }
 
     vkCmdBindPipeline(command_buffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -362,33 +364,6 @@ uint32_t tick() {
     vkCmdDispatch(command_buffers[i],
                   viewConfigurations[i].recommendedImageRectWidth / 16,
                   viewConfigurations[i].recommendedImageRectHeight / 16, 1);
-
-    //    VkImageMemoryBarrier barrier = {
-    //        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-    //        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-    //        .dstAccessMask = 0,
-    //        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-    //        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-    //        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-    //        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-    //        .image =
-    //        color_swapchains[i].images[aquired_color_image_index].image,
-    //        .subresourceRange =
-    //            {
-    //                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-    //                .baseMipLevel = 0,
-    //                .levelCount = 1,
-    //                .baseArrayLayer = 0,
-    //                .layerCount = 1,
-    //            },
-    //    };
-    //
-    //    vkCmdPipelineBarrier(
-    //        command_buffers[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-    //        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1,
-    //        &barrier);
-    //
-    //
 
     // vkCmdPipelineBarrier2
     {
@@ -454,7 +429,7 @@ uint32_t tick() {
           .pImageMemoryBarriers = barriers,
       };
 
-      // vkCmdPipelineBarrier2(command_buffers[i], &depInfo);
+      loaded_vkCmdPipelineBarrier2(command_buffers[i], &depInfo);
     }
 
     CHECK_VK(vkEndCommandBuffer(command_buffers[i]));
@@ -551,10 +526,30 @@ XrBool32 XRAPI_PTR openxrDebugCallback(
     XrDebugUtilsMessageSeverityFlagsEXT severity,
     XrDebugUtilsMessageTypeFlagsEXT types,
     const XrDebugUtilsMessengerCallbackDataEXT *data, void *userData) {
-  fprintf(stderr, "OpenXR: %s\n", data->message);
+  fprintf(stderr, "XR: %s\n\n", data->message);
   return XR_FALSE;
 }
 
+VKAPI_ATTR VkBool32 VKAPI_CALL
+debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+              VkDebugUtilsMessageTypeFlagsEXT messageType,
+              const VkDebugUtilsMessengerCallbackDataEXT *pCallbackData,
+              void *pUserData) {
+  fprintf(stderr, "VK: id:%d, message:%s\n\n", pCallbackData->messageIdNumber,
+          pCallbackData->pMessage);
+  for (uint32_t i = 0; i < pCallbackData->objectCount; i++) {
+    const VkDebugUtilsObjectNameInfoEXT *obj = &pCallbackData->pObjects[i];
+
+    fprintf(stderr, "  Object[%u]: type=%d handle=0x%llx name=%s\n", i,
+            obj->objectType, (unsigned long long)obj->objectHandle,
+            obj->pObjectName ? obj->pObjectName : "NULL");
+  }
+  // if (pCallbackData->messageIdNumber == 328638116) {
+  //   return VK_TRUE;
+  // }
+  //  Return VK_FALSE = do NOT abort the call
+  return VK_FALSE;
+}
 extern "C" int engine_main(
 #ifdef XR_USE_PLATFORM_ANDROID
     JavaVM *jvm, jobject main_activity,
@@ -562,7 +557,7 @@ extern "C" int engine_main(
                                 // TODO, this should be an atomic of some sort
 #endif
 ) {
-  LOGI("Message from inside engine_main");
+  LOGI("Message from inside engine_main\n");
 #ifdef XR_USE_PLATFORM_ANDROID
 
   LOGI("called with jvm=%p, main_activity=%p\n", (void *)jvm,
@@ -689,7 +684,7 @@ extern "C" int engine_main(
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "VRYume",
-        .apiVersion = VK_API_VERSION_1_1,
+        .apiVersion = VK_API_VERSION_1_2,
     };
 
 #ifdef XR_USE_PLATFORM_ANDROID
@@ -702,9 +697,17 @@ extern "C" int engine_main(
         .ppEnabledExtensionNames = instExts,
     };
 #else
+    const char *extensions[] = {"VK_KHR_surface",
+                                VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+    const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
+
     VkInstanceCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &app,
+        .enabledLayerCount = 1,
+        .ppEnabledLayerNames = layers,
+        .enabledExtensionCount = 2,
+        .ppEnabledExtensionNames = extensions,
     };
 #endif
 
@@ -724,6 +727,31 @@ extern "C" int engine_main(
         instance, &xr_vulkan_instance_create_info, &vkInstance, &vk_result));
 
     CHECK_VK(vk_result);
+  }
+
+  {
+    VkDebugUtilsMessengerCreateInfoEXT createInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .flags = 0,
+        .messageSeverity = // VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                           // VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+
+        .pfnUserCallback = debugCallback,
+    };
+
+    PFN_vkCreateDebugUtilsMessengerEXT vkCreateDebugUtilsMessengerEXT =
+        (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            vkInstance, "vkCreateDebugUtilsMessengerEXT");
+
+    VkDebugUtilsMessengerEXT debugMessenger;
+
+    vkCreateDebugUtilsMessengerEXT(vkInstance, &createInfo, nullptr,
+                                   &debugMessenger);
   }
 
   {
@@ -772,13 +800,23 @@ extern "C" int engine_main(
         .pQueuePriorities = &priority,
     };
 
-    const char *devExts[] = {"VK_KHR_swapchain", "VK_KHR_synchronization2"};
+    VkPhysicalDeviceSynchronization2FeaturesKHR sync2_features = {
+        .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+        .pNext = NULL,
+        .synchronization2 = VK_TRUE};
 
-    VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                              .queueCreateInfoCount = 1,
-                              .pQueueCreateInfos = &qci,
-                              .enabledExtensionCount = 2,
-                              .ppEnabledExtensionNames = devExts};
+    const char *device_extensions[] = {"VK_KHR_swapchain",
+                                       "VK_KHR_synchronization2"};
+
+    VkDeviceCreateInfo dci = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &sync2_features,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &qci,
+        .enabledExtensionCount = 2,
+        .ppEnabledExtensionNames = device_extensions,
+    };
 
     PFN_xrCreateVulkanDeviceKHR xrCreateVulkanDeviceKHR;
     xrGetInstanceProcAddr(instance, "xrCreateVulkanDeviceKHR",
@@ -855,7 +893,7 @@ extern "C" int engine_main(
         sizeof(XrViewConfigurationView) * viewCount);
 
     for (uint32_t i = 0; i < viewCount; i++) {
-      viewConfigurations[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+      viewConfigurations[i] = {.type = XR_TYPE_VIEW_CONFIGURATION_VIEW};
     }
 
     CHECK_XR(xrEnumerateViewConfigurationViews(
@@ -863,11 +901,17 @@ extern "C" int engine_main(
         viewCount, &viewCount, viewConfigurations));
 
     for (uint32_t i = 0; i < viewCount; i++) {
-      LOGI("view[%d]: %d x %d", i,
+      LOGI("view[%d]: %d x %d\n", i,
            viewConfigurations[i].recommendedImageRectWidth,
            viewConfigurations[i].recommendedImageRectHeight);
     }
-    LOGI("xrEnumerateViewConfigurationViews returned %u", viewCount);
+    LOGI("xrEnumerateViewConfigurationViews returned %u\n", viewCount);
+  }
+
+  {
+    loaded_vkCmdPipelineBarrier2 =
+        (PFN_vkCmdPipelineBarrier2KHR)vkGetDeviceProcAddr(
+            vkDevice, "vkCmdPipelineBarrier2KHR");
   }
 
   {
@@ -892,7 +936,12 @@ extern "C" int engine_main(
   color_swapchains = (Swapchain *)malloc(sizeof(Swapchain) * viewCount);
   for (uint32_t i = 0; i < viewCount; i++) {
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
+    swapchainInfo.usageFlags =
+        XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT; // added to get rid of some
+                                                 // Vulkan validation layers
+                                                 // errors complaining about
+                                                 // missing image usage flags
     swapchainInfo.format = color_swapchain_format;
 
     swapchainInfo.sampleCount =
@@ -950,6 +999,7 @@ extern "C" int engine_main(
                   .baseArrayLayer = 0,
                   .layerCount = 1,
               },
+
       };
 
       CHECK_VK(vkCreateImageView(vkDevice, &viewInfo, nullptr,
@@ -961,9 +1011,8 @@ extern "C" int engine_main(
   for (uint32_t i = 0; i < viewCount; i++) {
     XrSwapchainCreateInfo swapchain_create_info = {
         .type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
-        .usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
-                      XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+        .usageFlags = XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
+                      XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
         .format = depth_swapchain_format,
         .sampleCount = viewConfigurations[i].recommendedSwapchainSampleCount,
         .width = viewConfigurations[i].recommendedImageRectWidth,

@@ -1,3 +1,30 @@
+// [Note: OpenXR camera configuration]
+// In OpenXR, eye space origin is the eye position,
+// +X is the right direction
+// +Y is the up direction
+// -Z is the forward direction
+// the coordinate system is right handed.
+// OpenXR defines the camera by offering each eye transfrom
+// (translation/rotation) and 4 angles that define the view frustum.
+//
+// The angle absolute value is defined as the angle between the strait forward
+// direction -Z in eye space and the sides of the frustum, so for example:
+// fov.angleRight is the angle between -Z and the right side plane of the
+// frustum.
+//
+// The sign is given by convenstion to help in computing the coordinate
+// transfroms when computing the perspective matrix or other.
+// Right, Up are positive, Left, Down are negative.
+
+// [Note: coordinate systems]
+// Eye space, is defined by OpenXR see [Note: OpenXR camera configuration]
+//
+// 2D_NDC, this is just to map from pixel coordinates to float point
+// representing the relative position in the screen.
+// origin is at left down corner.
+// +X right of the screen, values range in [0, 1].
+// +Y up of the screen, values range in [0, 1]
+
 // to enable vulkan validation layers
 // adb shell setprop debug.oculus.loadandinjectpackagedvvl.com.kadhem.vryume 1
 // adb shell setprop debug.vvl.forcelayerlog 1
@@ -27,6 +54,7 @@
 #include <signal.h>
 #include <string.h>
 #include <inttypes.h>
+#include <cstdlib>
 
 #ifdef XR_USE_PLATFORM_ANDROID
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "vryume", __VA_ARGS__)
@@ -81,6 +109,262 @@ static VkFormat color_swapchain_format = VK_FORMAT_R8G8B8A8_UNORM;
 static VkFormat depth_swapchain_format =
     VK_FORMAT_D16_UNORM; // TODO: this is likely broken we need to test properly
 static PFN_vkCmdPipelineBarrier2KHR loaded_vkCmdPipelineBarrier2;
+static uint32_t device_only_memory_type_index;
+static VkMemoryPropertyFlags device_only_memory_type_property_flags;
+static VkDescriptorPool rendering_descriptor_pool;
+
+char *slow_concat(const char *a, const char *b) {
+  size_t len_a = strlen(a);
+  size_t len_b = strlen(b);
+
+  char *result = (char *)malloc(len_a + len_b + 1); // +1 for '\0'
+  assert(result);
+
+  strcpy(result, a);
+  strcat(result, b);
+
+  return result;
+}
+
+VkShaderModule load_shader_module(const char *file_name) {
+  VkShaderModule result;
+
+#ifdef XR_USE_PLATFORM_ANDROID
+  // TODO: this is not proper android, we should get the data folder path
+  // from an api
+  const char *base = "/data/user/0/com.kadhem.vryume/files/assets/";
+#else
+  const char *base = "./build/assets/";
+#endif
+
+  char *file_path = slow_concat(base, file_name);
+  FILE *f = fopen(file_path, "rb");
+  if (!f) {
+    LOGE("Error opening file: %s\n", strerror(errno));
+    std::exit(-1);
+  }
+
+  fseek(f, 0, SEEK_END);
+  size_t size = ftell(f);
+  rewind(f);
+
+  uint32_t *code = (uint32_t *)malloc(size);
+  fread(code, 1, size, f);
+  fclose(f);
+
+  VkShaderModuleCreateInfo shaderModuleInfo = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = size,
+      .pCode = code};
+
+  CHECK_VK(vkCreateShaderModule(vkDevice, &shaderModuleInfo, NULL, &result));
+
+  free(code);
+  free(file_path);
+
+  return result;
+}
+
+struct EvaluationPushConstant {
+  // vec3 position, alignment=16
+  float x;
+  float y;
+  float z;
+  float _pad; // pad so than next EvaluationPushConstant value in an array
+              // starts at the correct alignment
+};
+struct EvaluationState {
+  VkPipelineLayout pipeline_layout;
+  VkPipeline pipeline;
+  VkImageView tile_image_view;
+  VkImage tile_image;
+  VkDescriptorSet descriptor_set;
+  VkDeviceMemory tile_image_memory;
+  VkDescriptorSetLayout descriptor_set_layout;
+  VkExtent3D tile_image_extent;
+};
+
+static EvaluationState evaluation_state;
+// returns barrier needed to initialize the image before first shader access
+VkImageMemoryBarrier2 initialize_evaluation_state() {
+  {
+    VkDescriptorSetLayoutBinding tile_image_binding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .pImmutableSamplers = NULL};
+
+    VkDescriptorSetLayoutCreateInfo evaluation_descriptor_set_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &tile_image_binding};
+
+    CHECK_VK(vkCreateDescriptorSetLayout(
+        vkDevice, &evaluation_descriptor_set_layout_info, nullptr,
+        &evaluation_state.descriptor_set_layout));
+
+    VkDescriptorSetLayout set_layouts[] = {
+        evaluation_state.descriptor_set_layout};
+
+    VkPushConstantRange push_range = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(EvaluationPushConstant),
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = set_layouts,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_range};
+
+    CHECK_VK(vkCreatePipelineLayout(vkDevice, &pipelineLayoutInfo, nullptr,
+                                    &evaluation_state.pipeline_layout));
+  }
+
+  {
+
+    VkShaderModule shader_module = load_shader_module("evaluation.glsl.spv");
+
+    VkPipelineShaderStageCreateInfo stageInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shader_module,
+        .pName = "main"};
+
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = stageInfo,
+        .layout = evaluation_state.pipeline_layout};
+
+    CHECK_VK(vkCreateComputePipelines(vkDevice, VK_NULL_HANDLE, 1,
+                                      &pipeline_info, NULL,
+                                      &evaluation_state.pipeline));
+  }
+  {
+    evaluation_state.tile_image_extent = {
+        .width = 1000, .height = 1000, .depth = 1000};
+
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_3D,
+        .format = VK_FORMAT_R8_UINT,
+        // TODO image size must be divisible by shader group size, we need a way
+        // to make this less error prone
+        .extent = evaluation_state.tile_image_extent,
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    CHECK_VK(vkCreateImage(vkDevice, &image_info, nullptr,
+                           &evaluation_state.tile_image));
+    VkMemoryRequirements memory_requirements;
+    vkGetImageMemoryRequirements(vkDevice, evaluation_state.tile_image,
+                                 &memory_requirements);
+    assert(memory_requirements.memoryTypeBits &
+           (1u << device_only_memory_type_index));
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memory_requirements.size,
+        .memoryTypeIndex = device_only_memory_type_index};
+
+    CHECK_VK(vkAllocateMemory(vkDevice, &alloc_info, nullptr,
+                              &evaluation_state.tile_image_memory));
+
+    vkBindImageMemory(vkDevice, evaluation_state.tile_image,
+                      evaluation_state.tile_image_memory, 0);
+  }
+  {
+    VkImageViewCreateInfo image_view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = evaluation_state.tile_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_3D,
+        .format = VK_FORMAT_R8_UINT,
+        .components =
+            VkComponentMapping{
+                .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+        .subresourceRange =
+            VkImageSubresourceRange{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            }
+
+    };
+    CHECK_VK(vkCreateImageView(vkDevice, &image_view_info, nullptr,
+                               &evaluation_state.tile_image_view));
+  }
+
+  {
+    VkDescriptorSetAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = rendering_descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &evaluation_state.descriptor_set_layout,
+    };
+
+    CHECK_VK(vkAllocateDescriptorSets(vkDevice, &alloc_info,
+                                      &evaluation_state.descriptor_set));
+
+    VkDescriptorImageInfo image_info = {
+        .sampler = VK_NULL_HANDLE,
+        .imageView = evaluation_state.tile_image_view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // the layout our image will be
+                                                // at when used by shader
+    };
+
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = evaluation_state.descriptor_set,
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .pImageInfo = &image_info};
+
+    vkUpdateDescriptorSets(vkDevice, 1, &write, 0, nullptr);
+  }
+  VkImageMemoryBarrier2 barrier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+      .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+      .srcAccessMask = VK_ACCESS_2_NONE,
+
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstAccessMask =
+          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+      .image = evaluation_state.tile_image,
+      .subresourceRange =
+          {
+              .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          },
+  };
+  return barrier;
+}
 
 static bool is_xr_session_running = false;
 static bool should_run_framecycle = false;
@@ -89,7 +373,6 @@ uint32_t tick() {
   XrEventDataBuffer xr_event_buffer{.type = XR_TYPE_EVENT_DATA_BUFFER};
   XrResult result = xrPollEvent(instance, &xr_event_buffer);
   while (result == XR_SUCCESS) {
-    LOGI("event loop iter\n");
     switch (xr_event_buffer.type) {
 
     case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
@@ -838,6 +1121,26 @@ extern "C" int engine_main(
     vkGetDeviceQueue(vkDevice, vkQueueFamilyIndex, 0, &vkQueue);
   }
 
+  // device_only_memory_type_index
+  // device_only_memory_type_property_flags
+  {
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(vkPhysicalDevice, &memory_properties);
+
+    bool found_memory_type = false;
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags =
+          memory_properties.memoryTypes[i].propertyFlags;
+      if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+        device_only_memory_type_index = i;
+        device_only_memory_type_property_flags = flags;
+        found_memory_type = true;
+        break;
+      }
+    }
+    assert(found_memory_type);
+  }
+
   {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1147,40 +1450,7 @@ extern "C" int engine_main(
 
   // computePipeline
   {
-    VkShaderModule shaderModule;
-    {
-
-#ifdef XR_USE_PLATFORM_ANDROID
-      // TODO: this is not proper android, we should get the data folder path
-      // from an api
-      FILE *f = fopen(
-          "/data/user/0/com.kadhem.vryume/files/assets/main.glsl.spv", "rb");
-#else
-      FILE *f = fopen("./build/assets/main.glsl.spv", "rb");
-#endif
-      if (!f) {
-        LOGE("Error opening file: %s\n", strerror(errno));
-        return 1;
-      }
-
-      fseek(f, 0, SEEK_END);
-      size_t size = ftell(f);
-      rewind(f);
-
-      uint32_t *code = (uint32_t *)malloc(size);
-      fread(code, 1, size, f);
-      fclose(f);
-
-      VkShaderModuleCreateInfo shaderModuleInfo = {
-          .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-          .codeSize = size,
-          .pCode = code};
-
-      CHECK_VK(vkCreateShaderModule(vkDevice, &shaderModuleInfo, NULL,
-                                    &shaderModule));
-
-      free(code);
-    }
+    VkShaderModule shaderModule = load_shader_module("main.glsl.spv");
 
     VkPipelineShaderStageCreateInfo stageInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1287,6 +1557,123 @@ extern "C" int engine_main(
       }
     }
   }
+
+  // rendering_descriptor_pool
+  // a descriptor pool for things that are not present related
+  {
+    VkDescriptorPoolSize pool_size = {
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 10, // TODO: need a way to size this properly
+    };
+
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 10, // TODO: need a way to size this properly
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size};
+
+    CHECK_VK(vkCreateDescriptorPool(vkDevice, &pool_info, nullptr,
+                                    &rendering_descriptor_pool));
+  }
+
+  // initialize rendering related resources
+  {
+
+    CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
+    VkCommandBuffer init_commands;
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    CHECK_VK(vkAllocateCommandBuffers(
+        vkDevice, &alloc_info, &init_commands)); // pool will be reset before at
+                                                 // begining of first frame
+
+    VkCommandBufferBeginInfo begin_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    CHECK_VK(vkBeginCommandBuffer(init_commands, &begin_info));
+
+    auto barrier = initialize_evaluation_state();
+    VkDependencyInfo depInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    };
+
+    loaded_vkCmdPipelineBarrier2(init_commands, &depInfo);
+
+    CHECK_VK(vkEndCommandBuffer(init_commands));
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &init_commands,
+    };
+    CHECK_VK(vkQueueSubmit(vkQueue, 1, &submit_info, VK_NULL_HANDLE));
+    vkQueueWaitIdle(vkQueue);
+  }
+
+  // evaluate SDF
+  {
+    CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
+    VkCommandBuffer evaluation_commands;
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    CHECK_VK(vkAllocateCommandBuffers(
+        vkDevice, &alloc_info,
+        &evaluation_commands)); // pool will be reset before at
+                                // begining of first frame
+
+    VkCommandBufferBeginInfo begin_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    CHECK_VK(vkBeginCommandBuffer(evaluation_commands, &begin_info));
+
+    vkCmdBindPipeline(evaluation_commands,
+                      VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_COMPUTE,
+                      evaluation_state.pipeline);
+
+    EvaluationPushConstant evaluation_push_constant = {.x = 0, .y = 0, .z = 0};
+    vkCmdPushConstants(evaluation_commands, evaluation_state.pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, // offset
+                       sizeof(EvaluationPushConstant),
+                       &evaluation_push_constant);
+
+    vkCmdBindDescriptorSets(evaluation_commands, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            evaluation_state.pipeline_layout,
+                            0, // firstSet
+                            1, // setCount
+                            &evaluation_state.descriptor_set, 0, nullptr);
+
+    vkCmdDispatch(evaluation_commands,
+                  evaluation_state.tile_image_extent.width / 8,
+                  evaluation_state.tile_image_extent.height / 8,
+                  evaluation_state.tile_image_extent.depth / 8);
+
+    CHECK_VK(vkEndCommandBuffer(evaluation_commands));
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &evaluation_commands,
+    };
+    CHECK_VK(vkQueueSubmit(vkQueue, 1, &submit_info, VK_NULL_HANDLE));
+
+    // TODO: we should probably not use the queue idle here
+    vkQueueWaitIdle(vkQueue);
+  }
+
+  // end of initialization
 
 #ifdef XR_USE_PLATFORM_ANDROID
   while (!*android_requests_exit) {

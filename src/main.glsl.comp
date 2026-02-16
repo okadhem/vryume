@@ -14,6 +14,41 @@ layout(
     r16
 ) uniform writeonly image2D depth_image;
 
+
+//TODO double check
+vec3 rotate_by_quat(vec4 q, vec3 v) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+//TODO does NDC need to be openXR compatible? 
+vec3 ray_direction_world(ivec2 pixel_coord) {
+    // coordinates of pixel in 2D NDC
+    // this is just to map from pixel coordinates to float point
+    // representing the relative position in the screen.
+    // origin is at left down corner.
+    // +X right of the screen, values range in [0, 1].
+    // +Y up of the screen, values range in [0, 1]
+    vec2 uv =(vec2(pixel_coord) + 0.5) / resolution; // the 0.5 is to center the sample in the pixel
+
+    // consider the projection plane at 1 unit in front of the eye (z = -1),
+    // we limit that plane from all sides with the frustum FOV:
+    // coordinate limit to the right =  distance_to_plane * tanRight = tanRight
+    // coordinate limit to the left = distance_to_plane * tanLeft = tanLeft
+    // note that tanLeft will already be negative, so we get a negative limit
+    // to the left and a positive one to the right directly.
+    // our pixel_coord defines a point in this rectangle, we just need to remap
+    // the range linearly.
+    // since the point belongs to the projection plane, its projection is itself.
+    // therefore its view coordinates are its remapped NDC coordinates.
+    // ray direction is from the eye (origin) to this point.
+    float x = mix(tanLeft, tanRight, uv.x);
+    float y = mix(tanDown, tanUp, uv.y);
+    vec3 ray_direction_eye = normalize(vec3(x,y,-1.0));
+
+    return normalize(rotate_by_quat(camera.orientation, ray_direction_eye));
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     imageStore(color_image, coord, vec4(0.0, 1.0, 1.0, 1.0));

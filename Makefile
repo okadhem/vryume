@@ -47,7 +47,7 @@ android_debug: $(OBJ_DIR) $(SHADER_OBJ_DIR) $(OBJ) $(COMP_SHADERS_OBJ)
 desktop_debug: CXX := clang++
 desktop_debug: LD  := clang++
 desktop_debug: LIBS_PATH := -L$(PROJECT_ROOT)third_party/linux/libs
-desktop_debug: LDFLAGS := $(LIBS_PATH) -lvulkan -lopenxr_loader
+desktop_debug: LDFLAGS := $(LIBS_PATH) -lvulkan -lopenxr_loader -ldl
 desktop_debug: CXXFLAGS := $(COMMON_FLAGS) $(DEBUG_FLAGS)
 desktop_debug: $(OBJ_DIR) $(SHADER_OBJ_DIR) $(OBJ) $(COMP_SHADERS_OBJ) 
 	$(CXX) $(OBJ) -o ./build/game_exe $(LDFLAGS)

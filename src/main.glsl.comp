@@ -14,44 +14,179 @@ layout(
     r16
 ) uniform writeonly image2D depth_image;
 
+layout(
+    set = 2,
+    binding = 0
+) uniform sampler3D tile_image;
+
+layout(std430, push_constant) uniform PushConstant {
+    vec4 camera_orientation; // normalized quat
+    vec3 camera_pos;
+    float tanLeft;
+    float tanRight;
+    float tanUp;
+    float tanDown;
+    vec3 tile_pos; // in model space
+    vec3 tile_extent; // in m 
+    vec2 resolution; // (width,height)
+} pc;
+
 
 //TODO double check
+// q normalized quaternion
 vec3 rotate_by_quat(vec4 q, vec3 v) {
     vec3 t = 2.0 * cross(q.xyz, v);
     return v + q.w * t + cross(q.xyz, t);
 }
 
-//TODO does NDC need to be openXR compatible? 
-vec3 ray_direction_world(ivec2 pixel_coord) {
-    // coordinates of pixel in 2D NDC
-    // this is just to map from pixel coordinates to float point
-    // representing the relative position in the screen.
-    // origin is at left down corner.
-    // +X right of the screen, values range in [0, 1].
-    // +Y up of the screen, values range in [0, 1]
-    vec2 uv =(vec2(pixel_coord) + 0.5) / resolution; // the 0.5 is to center the sample in the pixel
-
-    // consider the projection plane at 1 unit in front of the eye (z = -1),
-    // we limit that plane from all sides with the frustum FOV:
-    // coordinate limit to the right =  distance_to_plane * tanRight = tanRight
-    // coordinate limit to the left = distance_to_plane * tanLeft = tanLeft
-    // note that tanLeft will already be negative, so we get a negative limit
-    // to the left and a positive one to the right directly.
-    // our pixel_coord defines a point in this rectangle, we just need to remap
-    // the range linearly.
-    // since the point belongs to the projection plane, its projection is itself.
-    // therefore its view coordinates are its remapped NDC coordinates.
-    // ray direction is from the eye (origin) to this point.
-    float x = mix(tanLeft, tanRight, uv.x);
-    float y = mix(tanDown, tanUp, uv.y);
-    vec3 ray_direction_eye = normalize(vec3(x,y,-1.0));
-
-    return normalize(rotate_by_quat(camera.orientation, ray_direction_eye));
+vec4 inverse_unit_quat(vec4 q) {
+    return vec4(-q.x,-q.y,-q.z,q.w);
 }
 
+//TODO thoese two need to be a define
+const float encoded_distance_resolution = 0.0005; // in m
+const float max_representable_distance = 255.0 * encoded_distance_resolution; // in m
+float decode_distance(float sampled_distance) {
+    return sampled_distance * max_representable_distance;
+}
+
+float sdf_norm(vec3 p_norm) {
+    return decode_distance(texture(tile_image, p_norm).r);
+}
+
+float sdf(vec3 p) {
+    vec3 p_norm = p / pc.tile_extent;
+    return sdf_norm(p_norm);
+}
+
+const float h = 1e-4; // TODO define somewhere
+vec3 sdf_grad(vec3 p) // from chatgpt
+{
+    return vec3(
+        sdf(p + vec3(h,0,0)) - sdf(p - vec3(h,0,0)),
+        sdf(p + vec3(0,h,0)) - sdf(p - vec3(0,h,0)),
+        sdf(p + vec3(0,0,h)) - sdf(p - vec3(0,0,h))
+    ) / (2.0 * h);
+}
+
+
+vec3 vector_tile_to_world(vec3 v) {
+    //tile is only translated in world space, so for vectors coordinates don't change 
+    //between tile and object space
+    //TODO: for now we are assuming object space == world space
+    return v;
+}
+vec3 vector_world_to_tile(vec3 v) {
+    //tile is only translated in world space, so for vectors coordinates don't change 
+    //between tile and object space
+    //TODO: for now we are assuming object space == world space
+    return v;
+}
+vec3 vector_eye_to_world(vec3 v) {
+    return rotate_by_quat(pc.camera_orientation, v);
+}
+
+vec3 point_world_to_eye(vec3 p) {
+    return rotate_by_quat(inverse_unit_quat(pc.camera_orientation), p - pc.camera_pos);
+}
+
+vec3 point_model_to_world(vec3 p) {
+    //TODO
+    return p;
+}
+vec3 point_world_to_model(vec3 p) {
+    //TODO
+    return p;
+}
+vec3 point_tile_to_world(vec3 p) {
+    return point_model_to_world(pc.tile_pos + p);
+}
+vec3 point_world_to_tile(vec3 p) {
+    return point_world_to_model(p) - pc.tile_pos;
+}
+
+
+const float zero_distance = 0.001;
 void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
-    imageStore(color_image, coord, vec4(0.0, 1.0, 1.0, 1.0));
-    //imageStore(color_image, coord, vec4(0.5, 0.5, 0.5, 1.0));
-    imageStore(depth_image, coord, vec4(0.0, 0.0, 0.0, 0.0));  // only x matters, 0 is near plane
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+
+    vec3 ray_direction_world; // normalized
+    {
+        //TODO does NDC need to be openXR compatible? 
+
+        // coordinates of pixel in 2D NDC
+        // this is just to map from pixel coordinates to float point
+        // representing the relative position in the screen.
+        // origin is at left down corner.
+        // +X right of the screen, values range in [0, 1].
+        // +Y up of the screen, values range in [0, 1]
+        vec2 uv =(vec2(pixel_coord) + 0.5) / pc.resolution; // the 0.5 is to center the sample in the pixel
+
+        // consider the projection plane at 1 unit in front of the eye (z = -1),
+        // we limit that plane from all sides with the frustum FOV:
+        // coordinate limit to the right =  distance_to_plane * tanRight = tanRight
+        // coordinate limit to the left = distance_to_plane * tanLeft = tanLeft
+        // note that tanLeft will already be negative, so we get a negative limit
+        // to the left and a positive one to the right directly.
+        // our pixel_coord defines a point in this rectangle, we just need to remap
+        // the range linearly.
+        // since the point belongs to the projection plane, its projection is itself.
+        // therefore its view coordinates are its remapped NDC coordinates.
+        // ray direction is from the eye (origin) to this point.
+        float x = mix(pc.tanLeft, pc.tanRight, uv.x);
+        float y = mix(pc.tanDown, pc.tanUp, uv.y);
+        vec3 ray_direction_eye = normalize(vec3(x,y,-1.0));
+
+        ray_direction_world = normalize(vector_eye_to_world(ray_direction_eye));
+    }
+
+    vec3 ray_direction_tile = vector_world_to_tile(ray_direction_world);
+    vec3 ray_origin_tile = point_world_to_tile(pc.camera_pos);
+
+    vec3 ray_tip = ray_origin_tile;
+    bool out_of_tile = false;
+    float debug_distance = 0;
+    {
+        float distance = 0.0;
+        do {
+            vec3 ray_tip_norm = ray_tip / pc.tile_extent;
+            bool in_range = all(greaterThanEqual(ray_tip_norm, vec3(0.0))) && all(lessThanEqual(ray_tip_norm, vec3(1.0)));
+            if (!in_range) {
+                out_of_tile = true;
+                break;
+            }
+            distance = sdf_norm(ray_tip_norm);
+            debug_distance = distance;
+
+            ray_tip += ray_direction_tile * distance; 
+        } while(distance > zero_distance);
+    }
+
+    if (out_of_tile) {
+        imageStore(color_image, pixel_coord, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(depth_image, pixel_coord, vec4(1.0, 0.0, 0.0, 0.0));  // only x matters, 0 is near plane
+        return; 
+    }     
+
+    // shading
+    vec3 normal_world = vector_tile_to_world(normalize(sdf_grad(ray_tip)));
+    vec3 light_direction_world = normalize(vec3(1.0, 1.0, 1.0)); // from surface to light source
+    vec3 light_color = vec3(0.0); 
+    vec3 object_color = vec3(1.0, 0.0, 0.0);
+    vec3 diffuse = light_color * object_color * max(dot(normal_world, light_direction_world), 0.0);
+
+    vec3 reflected_light_world = reflect(-light_direction_world, normal_world); // from surface to reflected direction
+    vec3 view_direction_world = -ray_direction_world; //normalized direction from surface to camera
+    float shininess = 32.0;
+    float spec = pow(max(dot(reflected_light_world, view_direction_world), 0.0), shininess);
+    vec3 specular = light_color * spec;
+
+    vec3 ambient = 0.1 * object_color;
+
+    vec3 color = ambient + diffuse + specular;
+    imageStore(color_image, pixel_coord, vec4(vec3(0,1,0), 1.0));
+
+    float depth = point_world_to_eye(point_tile_to_world(ray_tip)).z;
+    //float debug_ray_tip = sdf_norm(ray_origin_tile / pc.tile_extent);
+    imageStore(depth_image, pixel_coord, vec4(depth, 0.0, 0.0, 0.0));  // only x matters, 0 is near plane
 }

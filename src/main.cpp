@@ -16,15 +16,6 @@
 // transfroms when computing the perspective matrix or other.
 // Right, Up are positive, Left, Down are negative.
 
-// [Note: coordinate systems]
-// Eye space, is defined by OpenXR see [Note: OpenXR camera configuration]
-//
-// 2D_NDC, this is just to map from pixel coordinates to float point
-// representing the relative position in the screen.
-// origin is at left down corner.
-// +X right of the screen, values range in [0, 1].
-// +Y up of the screen, values range in [0, 1]
-
 // to enable vulkan validation layers
 // adb shell setprop debug.oculus.loadandinjectpackagedvvl.com.kadhem.vryume 1
 // adb shell setprop debug.vvl.forcelayerlog 1
@@ -55,6 +46,9 @@
 #include <string.h>
 #include <inttypes.h>
 #include <cstdlib>
+#include <cmath>
+#include <renderdoc_app.h>
+#include <dlfcn.h>
 
 #ifdef XR_USE_PLATFORM_ANDROID
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "vryume", __VA_ARGS__)
@@ -82,6 +76,8 @@ struct Swapchain {
   uint32_t image_count;
   VkDescriptorSet *descriptor_sets; // one per image
   VkImageView *image_views;         // one per image
+  uint32_t width;
+  uint32_t height;
 };
 
 static XrInstance instance;
@@ -112,7 +108,13 @@ static PFN_vkCmdPipelineBarrier2KHR loaded_vkCmdPipelineBarrier2;
 static uint32_t device_only_memory_type_index;
 static VkMemoryPropertyFlags device_only_memory_type_property_flags;
 static VkDescriptorPool rendering_descriptor_pool;
+static VkDescriptorSet rendering_descriptor_set;
+static VkSampler rendering_tile_sampler;
+static RENDERDOC_API_1_4_1 *renderdoc_api = nullptr;
 
+// TODO: this is shared with the shader, and as such we should define it
+// somewhere global not duplciate it
+constexpr float inter_sample_distance = 0.002; // in m
 char *slow_concat(const char *a, const char *b) {
   size_t len_a = strlen(a);
   size_t len_b = strlen(b);
@@ -166,11 +168,8 @@ VkShaderModule load_shader_module(const char *file_name) {
 }
 
 struct EvaluationPushConstant {
-  // vec3 position, alignment=16
-  float x;
-  float y;
-  float z;
-  float _pad; // pad so than next EvaluationPushConstant value in an array
+  float tile_pos[3]; // vec3 alignment=16
+  float _pad; // pad to 16 so than next EvaluationPushConstant value in an array
               // starts at the correct alignment
 };
 struct EvaluationState {
@@ -250,7 +249,7 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
     VkImageCreateInfo image_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_3D,
-        .format = VK_FORMAT_R8_UINT,
+        .format = VK_FORMAT_R8_UNORM,
         // TODO image size must be divisible by shader group size, we need a way
         // to make this less error prone
         .extent = evaluation_state.tile_image_extent,
@@ -258,9 +257,7 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     CHECK_VK(vkCreateImage(vkDevice, &image_info, nullptr,
@@ -286,7 +283,7 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = evaluation_state.tile_image,
         .viewType = VK_IMAGE_VIEW_TYPE_3D,
-        .format = VK_FORMAT_R8_UINT,
+        .format = VK_FORMAT_R8_UNORM,
         .components =
             VkComponentMapping{
                 .r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -365,6 +362,24 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
   };
   return barrier;
 }
+
+struct RenderingPushConstant {
+  float camera_orientation[4];
+  float camera_pos[3];
+  float tanLeft; // starts at 28
+  float tanRight;
+  float tanUp;
+  float tanDown;
+  float _pad;
+  float tile_pos[3]; // starts at 48
+  float _pad2;
+  float tile_extent[3];
+  float _pad3;
+  float resolution[2]; // starts at 80
+  float _pad4[2];      // to align struct to 16
+};
+static_assert(sizeof(RenderingPushConstant) == 96);
+static_assert(sizeof(RenderingPushConstant) < 128, "PushConstant limit");
 
 static bool is_xr_session_running = false;
 static bool should_run_framecycle = false;
@@ -494,6 +509,9 @@ uint32_t tick() {
   }
 
   // should we ? assert(_out_view_count == viewCount);
+
+  if (renderdoc_api)
+    renderdoc_api->StartFrameCapture(NULL, NULL);
 
   XrFrameBeginInfo frame_begin_info = {
       .type = XR_TYPE_FRAME_BEGIN_INFO,
@@ -634,15 +652,48 @@ uint32_t tick() {
     vkCmdBindPipeline(command_buffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
                       computePipeline);
 
-    VkDescriptorSet sets[2] = {
+    VkDescriptorSet sets[3] = {
         color_swapchains[i].descriptor_sets[aquired_color_image_index],
-        depth_swapchains[i].descriptor_sets[aquired_depth_image_index]};
+        depth_swapchains[i].descriptor_sets[aquired_depth_image_index],
+        rendering_descriptor_set,
+    };
 
     vkCmdBindDescriptorSets(command_buffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipelineLayout,
                             0, // firstSet
-                            2, // setCount
+                            3, // setCount
                             sets, 0, nullptr);
+
+    auto orientation = views[i].pose.orientation;
+    auto pos = views[i].pose.position;
+    RenderingPushConstant rendering_push_constant = {
+        //.camera_orientation = {orientation.x, orientation.y, orientation.z,
+        //                       orientation.w},
+        .camera_orientation = {0, 1, 0, 0.0000463},
+        .camera_pos = {pos.x + 0.5f, pos.y + 0.5f,
+                       pos.z + 0.5f}, // TODO, offset just for debugging
+        .tanLeft = tanf(views[i].fov.angleLeft),
+        .tanRight = tanf(views[i].fov.angleRight),
+        .tanUp = tanf(views[i].fov.angleUp),
+        .tanDown = tanf(views[i].fov.angleDown),
+        .tile_pos = {0.0, 0.0, 0.0},
+        .tile_extent =
+            {
+                (float)((evaluation_state.tile_image_extent.width - 1) *
+                        inter_sample_distance),
+                (float)((evaluation_state.tile_image_extent.height - 1) *
+                        inter_sample_distance),
+                (float)((evaluation_state.tile_image_extent.depth - 1) *
+                        inter_sample_distance),
+            },
+        .resolution = {(float)color_swapchains[i].width,
+                       (float)color_swapchains[i].height},
+
+    };
+    vkCmdPushConstants(command_buffers[i], pipelineLayout,
+                       VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, // offset
+                       sizeof(RenderingPushConstant), &rendering_push_constant);
 
     vkCmdDispatch(command_buffers[i],
                   viewConfigurations[i].recommendedImageRectWidth / 16,
@@ -802,6 +853,9 @@ uint32_t tick() {
 
   CHECK_XR(xrEndFrame(session, &frame_end_info));
 
+  if (renderdoc_api)
+    renderdoc_api->EndFrameCapture(NULL, NULL);
+
   return 0;
 }
 
@@ -841,6 +895,27 @@ extern "C" int engine_main(
 #endif
 ) {
   LOGI("Message from inside engine_main\n");
+
+  // setup RenderDoc
+  {
+    // Look for the already-injected renderdoc library
+    void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+    if (mod) {
+      // Fetch the function pointer to get the API
+      pRENDERDOC_GetAPI RENDERDOC_GetAPI =
+          (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
+
+      // Populate the API structure (using version 1.4.1 as an example)
+      int ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_4_1,
+                                 (void **)&renderdoc_api);
+      if (ret == 1) {
+        LOGI("RenderDoc API successfully hooked!\n");
+      }
+    } else {
+      LOGI("RenderDoc not detected. Running normally.\n");
+    }
+  }
+
 #ifdef XR_USE_PLATFORM_ANDROID
 
   LOGI("called with jvm=%p, main_activity=%p\n", (void *)jvm,
@@ -1238,6 +1313,10 @@ extern "C" int engine_main(
 
   color_swapchains = (Swapchain *)malloc(sizeof(Swapchain) * viewCount);
   for (uint32_t i = 0; i < viewCount; i++) {
+    color_swapchains[i].width = viewConfigurations[i].recommendedImageRectWidth;
+    color_swapchains[i].height =
+        viewConfigurations[i].recommendedImageRectHeight;
+
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags =
         XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
@@ -1249,8 +1328,8 @@ extern "C" int engine_main(
 
     swapchainInfo.sampleCount =
         viewConfigurations[i].recommendedSwapchainSampleCount;
-    swapchainInfo.width = viewConfigurations[i].recommendedImageRectWidth;
-    swapchainInfo.height = viewConfigurations[i].recommendedImageRectHeight;
+    swapchainInfo.width = color_swapchains[i].width;
+    swapchainInfo.height = color_swapchains[i].height;
     swapchainInfo.faceCount = 1;
     swapchainInfo.arraySize = 1;
     swapchainInfo.mipCount = 1;
@@ -1312,14 +1391,18 @@ extern "C" int engine_main(
 
   depth_swapchains = (Swapchain *)malloc(sizeof(Swapchain) * viewCount);
   for (uint32_t i = 0; i < viewCount; i++) {
+    depth_swapchains[i].width = viewConfigurations[i].recommendedImageRectWidth;
+    depth_swapchains[i].height =
+        viewConfigurations[i].recommendedImageRectHeight;
+
     XrSwapchainCreateInfo swapchain_create_info = {
         .type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
         .usageFlags = XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
                       XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
         .format = depth_swapchain_format,
         .sampleCount = viewConfigurations[i].recommendedSwapchainSampleCount,
-        .width = viewConfigurations[i].recommendedImageRectWidth,
-        .height = viewConfigurations[i].recommendedImageRectHeight,
+        .width = depth_swapchains[i].width,
+        .height = depth_swapchains[i].height,
         .faceCount = 1,
         .arraySize = 1,
         .mipCount = 1,
@@ -1400,6 +1483,7 @@ extern "C" int engine_main(
   // pipelineLayout
   VkDescriptorSetLayout color_descriptor_set_layout;
   VkDescriptorSetLayout depth_descriptor_set_layout;
+  VkDescriptorSetLayout rendering_set_layout;
   {
 
     VkDescriptorSetLayoutBinding color_image_binding = {
@@ -1434,15 +1518,38 @@ extern "C" int engine_main(
                                          &depthDescriptorSetLayoutInfo, nullptr,
                                          &depth_descriptor_set_layout));
 
+    VkDescriptorSetLayoutBinding tile_descriptor_set_layout_binding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+
+    VkDescriptorSetLayoutCreateInfo tile_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &tile_descriptor_set_layout_binding,
+    };
+
+    vkCreateDescriptorSetLayout(vkDevice, &tile_layout_info, nullptr,
+                                &rendering_set_layout);
+
     VkDescriptorSetLayout set_layouts[] = {color_descriptor_set_layout,
-                                           depth_descriptor_set_layout};
+                                           depth_descriptor_set_layout,
+                                           rendering_set_layout};
+
+    VkPushConstantRange push_range = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(RenderingPushConstant),
+    };
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 2,
+        .setLayoutCount = 3,
         .pSetLayouts = set_layouts,
-        .pushConstantRangeCount = 0,
-        .pPushConstantRanges = nullptr};
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_range};
 
     CHECK_VK(vkCreatePipelineLayout(vkDevice, &pipelineLayoutInfo, NULL,
                                     &pipelineLayout));
@@ -1561,16 +1668,22 @@ extern "C" int engine_main(
   // rendering_descriptor_pool
   // a descriptor pool for things that are not present related
   {
-    VkDescriptorPoolSize pool_size = {
+    VkDescriptorPoolSize pool_storage_image_size = {
         .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         .descriptorCount = 10, // TODO: need a way to size this properly
     };
+    VkDescriptorPoolSize pool_combined_image_size = {
+        .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 10, // TODO: need a way to size this properly
+    };
 
+    VkDescriptorPoolSize pool_sizes[2] = {pool_combined_image_size,
+                                          pool_storage_image_size};
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 10, // TODO: need a way to size this properly
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size};
+        .poolSizeCount = 2,
+        .pPoolSizes = pool_sizes};
 
     CHECK_VK(vkCreateDescriptorPool(vkDevice, &pool_info, nullptr,
                                     &rendering_descriptor_pool));
@@ -1578,7 +1691,6 @@ extern "C" int engine_main(
 
   // initialize rendering related resources
   {
-
     CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
     VkCommandBuffer init_commands;
     VkCommandBufferAllocateInfo alloc_info = {
@@ -1615,6 +1727,63 @@ extern "C" int engine_main(
     };
     CHECK_VK(vkQueueSubmit(vkQueue, 1, &submit_info, VK_NULL_HANDLE));
     vkQueueWaitIdle(vkQueue);
+
+    // descriptor & sampler for tile in rendering shader
+    {
+      VkDescriptorSetAllocateInfo allocInfo = {
+          .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+          .descriptorPool = rendering_descriptor_pool,
+          .descriptorSetCount = 1,
+          .pSetLayouts = &rendering_set_layout,
+      };
+
+      vkAllocateDescriptorSets(vkDevice, &allocInfo, &rendering_descriptor_set);
+
+      VkSamplerCreateInfo samplerInfo = {
+          .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+
+          .magFilter = VK_FILTER_LINEAR,
+          .minFilter = VK_FILTER_LINEAR,
+
+          .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+
+          .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+          .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+          .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+
+          .mipLodBias = 0.0f,
+          .anisotropyEnable = VK_FALSE,
+          .maxAnisotropy = 1.0f,
+
+          .compareEnable = VK_FALSE,
+          .compareOp = VK_COMPARE_OP_ALWAYS,
+
+          .minLod = 0.0f,
+          .maxLod = 0.0f, // only one mip level
+
+          .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+          .unnormalizedCoordinates = VK_FALSE,
+      };
+
+      vkCreateSampler(vkDevice, &samplerInfo, nullptr, &rendering_tile_sampler);
+
+      VkDescriptorImageInfo imageInfo = {
+          .sampler = rendering_tile_sampler,
+          .imageView = evaluation_state.tile_image_view,
+          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      };
+
+      VkWriteDescriptorSet write = {
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = rendering_descriptor_set,
+          .dstBinding = 0,
+          .dstArrayElement = 0,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .pImageInfo = &imageInfo};
+
+      vkUpdateDescriptorSets(vkDevice, 1, &write, 0, nullptr);
+    }
   }
 
   // evaluate SDF
@@ -1642,7 +1811,7 @@ extern "C" int engine_main(
                       VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_COMPUTE,
                       evaluation_state.pipeline);
 
-    EvaluationPushConstant evaluation_push_constant = {.x = 0, .y = 0, .z = 0};
+    EvaluationPushConstant evaluation_push_constant = {.tile_pos = {0, 0, 0}};
     vkCmdPushConstants(evaluation_commands, evaluation_state.pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT,
                        0, // offset
@@ -1659,6 +1828,42 @@ extern "C" int engine_main(
                   evaluation_state.tile_image_extent.width / 8,
                   evaluation_state.tile_image_extent.height / 8,
                   evaluation_state.tile_image_extent.depth / 8);
+
+    // transition the tile image to shader read layout
+    {
+      VkImageMemoryBarrier2 barrier = {
+          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+          .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+          .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+
+          .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+          .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+
+          .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+          .image = evaluation_state.tile_image,
+          .subresourceRange =
+              {
+                  .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                  .baseMipLevel = 0,
+                  .levelCount = 1,
+                  .baseArrayLayer = 0,
+                  .layerCount = 1,
+              },
+      };
+      VkDependencyInfo depInfo = {
+          .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+          .imageMemoryBarrierCount = 1,
+          .pImageMemoryBarriers = &barrier,
+      };
+
+      loaded_vkCmdPipelineBarrier2(evaluation_commands, &depInfo);
+    }
 
     CHECK_VK(vkEndCommandBuffer(evaluation_commands));
 

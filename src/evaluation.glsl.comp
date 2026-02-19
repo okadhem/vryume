@@ -1,0 +1,45 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(push_constant) uniform PushConstant {
+    vec3 tile_pos; // in model space
+} push_constant;
+
+layout(
+    set = 0,
+    binding = 0,
+    r8
+) uniform writeonly image3D tile_image;
+
+
+float sphere_at_origin(vec3 pos, float r) {
+    return length(pos) - r;
+}
+//pos in model space
+//returns distance in meters
+float model_signed_distance(vec3 pos) {
+    return sphere_at_origin(pos, 0.2);
+}
+
+// Distance between two representable distance values, first representable value is 0 then we add this step to get the next one
+// untill we reach max representable value
+// it follows that // Maximum error in encoding is encoded_distance_resolution / 2, because we round to the nearest int after the division
+const float encoded_distance_resolution = 0.0005; // in m
+const float max_representable_distance = 255.0 * encoded_distance_resolution;
+// returns a 8 bit unsigned int
+//uint encode_distance(float distance) {
+//    return uint(clamp(round(distance / encoded_distance_resolution), 0, 255));
+//}
+
+float encode_distance(float distance) {
+    return clamp(distance / max_representable_distance, 0, 1);
+}
+
+const float inter_sample_distance = 0.002; // in m
+void main() {
+    ivec3 invocation_id = ivec3(gl_GlobalInvocationID.xyz);
+    vec3 sample_position = push_constant.tile_pos + invocation_id * inter_sample_distance; // in model space
+    float encoded_distance = encode_distance(model_signed_distance(sample_position));
+    imageStore(tile_image, invocation_id, vec4(encoded_distance, 0, 0, 0));
+}

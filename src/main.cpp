@@ -102,8 +102,9 @@ static XrSpace xr_space_stage;
 static VkPipelineLayout pipelineLayout;
 static VkPipeline computePipeline;
 static VkFormat color_swapchain_format = VK_FORMAT_R8G8B8A8_UNORM;
-static VkFormat depth_swapchain_format =
-    VK_FORMAT_D16_UNORM; // TODO: this is likely broken we need to test properly
+// openXR wants depth to represent distance (non normalized).
+// TODO: this is not stictly api conform we are using this as a storage image
+static VkFormat depth_swapchain_format = VK_FORMAT_D32_SFLOAT;
 static PFN_vkCmdPipelineBarrier2KHR loaded_vkCmdPipelineBarrier2;
 static uint32_t device_only_memory_type_index;
 static VkMemoryPropertyFlags device_only_memory_type_property_flags;
@@ -667,15 +668,18 @@ uint32_t tick() {
     auto orientation = views[i].pose.orientation;
     auto pos = views[i].pose.position;
     RenderingPushConstant rendering_push_constant = {
-        //.camera_orientation = {orientation.x, orientation.y, orientation.z,
-        //                       orientation.w},
-        .camera_orientation = {0, 1, 0, 0.0000463},
-        .camera_pos = {pos.x + 0.5f, pos.y + 0.5f,
+        .camera_orientation = {orientation.x, orientation.y, orientation.z,
+                               orientation.w},
+        //.camera_orientation = {-0.3826834, 0, 0, 0.9238796}, // -45 X
+        //.camera_orientation = {0, 0, 0, 1}, // -45 X
+        .camera_pos = {pos.x + 0.5f, pos.y - 0.8f,
                        pos.z + 0.5f}, // TODO, offset just for debugging
-        .tanLeft = tanf(views[i].fov.angleLeft),
-        .tanRight = tanf(views[i].fov.angleRight),
-        .tanUp = tanf(views[i].fov.angleUp),
-        .tanDown = tanf(views[i].fov.angleDown),
+        //.camera_pos = {0.05, 0.2, 0.2},
+        //.camera_pos = {0, 0, 0.4},
+        .tanLeft = (float)tan(views[i].fov.angleLeft),
+        .tanRight = (float)tan(views[i].fov.angleRight),
+        .tanUp = (float)tan(views[i].fov.angleUp),
+        .tanDown = (float)tan(views[i].fov.angleDown),
         .tile_pos = {0.0, 0.0, 0.0},
         .tile_extent =
             {

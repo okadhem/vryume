@@ -19,6 +19,7 @@
 // to enable vulkan validation layers
 // adb shell setprop debug.oculus.loadandinjectpackagedvvl.com.kadhem.vryume 1
 // adb shell setprop debug.vvl.forcelayerlog 1
+#include "glm/ext/vector_float3.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -49,6 +50,11 @@
 #include <cmath>
 #include <renderdoc_app.h>
 #include <dlfcn.h>
+#include <glm/ext/quaternion_float.hpp>
+#include <glm/vec3.hpp>
+#include <glm/gtc/quaternion.hpp>
+
+using namespace glm;
 
 #ifdef XR_USE_PLATFORM_ANDROID
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "vryume", __VA_ARGS__)
@@ -99,6 +105,12 @@ static XrCompositionLayerDepthInfoKHR *composition_layer_depth_info;
 static XrCompositionLayerProjectionView *composition_layer_projection_views;
 static XrView *views;
 static XrSpace xr_space_stage;
+static XrSpace xr_space_view;
+static XrActionSet gameplayActionSet;
+static XrAction move_action;
+static XrAction capture_frame_action;
+static XrPath leftHandPath;
+static XrPath rightHandPath;
 static VkPipelineLayout pipelineLayout;
 static VkPipeline computePipeline;
 static VkFormat color_swapchain_format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -112,6 +124,19 @@ static VkDescriptorPool rendering_descriptor_pool;
 static VkDescriptorSet rendering_descriptor_set;
 static VkSampler rendering_tile_sampler;
 static RENDERDOC_API_1_4_1 *renderdoc_api = nullptr;
+static bool capture_frame = false;
+
+struct RigidTransform {
+  glm::quat rotation;
+  glm::vec3 translation;
+};
+
+// world space pose of the VR play area, this is the area where the camera
+// can move following headset motionw
+static RigidTransform tracking_origin_pose;
+
+// space attached to the headset, this is the stage head pose
+static RigidTransform stage_view_pose;
 
 // TODO: this is shared with the shader, and as such we should define it
 // somewhere global not duplciate it
@@ -127,6 +152,36 @@ char *slow_concat(const char *a, const char *b) {
   strcat(result, b);
 
   return result;
+}
+
+// math composition, f . g
+RigidTransform compose_transfrom(RigidTransform f, RigidTransform g) {
+  return RigidTransform{
+      .rotation = f.rotation * g.rotation,
+      .translation = (f.rotation * g.translation) + f.translation,
+  };
+}
+
+quat removePitchRoll(quat q) {
+  // headset forward direction
+  vec3 forward = q * vec3(0, 0, -1);
+
+  // project onto horizontal plane
+  forward.y = 0.0f;
+  forward = normalize(forward);
+
+  // compute yaw
+  float yaw = atan2(-forward.x, -forward.z);
+
+  // rebuild pure Y rotation
+  return angleAxis(yaw, vec3(0, 1, 0));
+}
+quat inverse_unit_quat(quat q) { return quat(q.w, -q.x, -q.y, -q.z); }
+
+RigidTransform inverse_transform(RigidTransform t) {
+  quat inv_rot = inverse_unit_quat(t.rotation);
+  return RigidTransform{.rotation = inv_rot,
+                        .translation = -(inv_rot * t.translation)};
 }
 
 VkShaderModule load_shader_module(const char *file_name) {
@@ -364,6 +419,16 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
   return barrier;
 }
 
+struct InputState {
+  XrActionStateVector2f right_move;
+  XrActionStateVector2f left_move;
+  XrActionStateBoolean capture_frame;
+  bool right_move_horizental_triggered;
+};
+// after how much is the continuous input considered triggered
+constexpr float input_trigger_threshold = 0.8;
+static InputState inputs = {};
+static InputState previous_inputs = {};
 struct RenderingPushConstant {
   float camera_orientation[4];
   float camera_pos[3];
@@ -384,6 +449,9 @@ static_assert(sizeof(RenderingPushConstant) < 128, "PushConstant limit");
 
 static bool is_xr_session_running = false;
 static bool should_run_framecycle = false;
+static XrTime display_time;              // in ns
+static XrTime previous_display_time = 0; // in ns
+static XrDuration frame_duration;        // in ns
 uint32_t tick() {
 
   XrEventDataBuffer xr_event_buffer{.type = XR_TYPE_EVENT_DATA_BUFFER};
@@ -501,6 +569,13 @@ uint32_t tick() {
         .type = XR_TYPE_FRAME_WAIT_INFO,
     };
     CHECK_XR(xrWaitFrame(session, &frame_wait_info, &frame_state));
+    previous_display_time = display_time;
+    display_time = frame_state.predictedDisplayTime;
+    if (previous_display_time == 0)
+      previous_display_time = display_time;
+
+    // TODO: there is a frame duration in the frame_state, check that
+    frame_duration = display_time - previous_display_time;
   }
 
   // TODO
@@ -510,9 +585,11 @@ uint32_t tick() {
   }
 
   // should we ? assert(_out_view_count == viewCount);
-
-  if (renderdoc_api)
+  bool frame_capture_ongoing = false;
+  if (renderdoc_api && capture_frame) {
     renderdoc_api->StartFrameCapture(NULL, NULL);
+    frame_capture_ongoing = true;
+  }
 
   XrFrameBeginInfo frame_begin_info = {
       .type = XR_TYPE_FRAME_BEGIN_INFO,
@@ -521,6 +598,7 @@ uint32_t tick() {
 
   CHECK_VK(
       vkWaitForFences(vkDevice, viewCount, fence_exec, VK_TRUE, UINT64_MAX));
+
   CHECK_VK(vkResetFences(vkDevice, viewCount, fence_exec));
   CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
 
@@ -551,6 +629,146 @@ uint32_t tick() {
 
     CHECK_XR(xrLocateViews(session, &view_locate_info, &view_state, viewCount,
                            &_out_view_count, views));
+  }
+
+  // stage_view_pose
+  {
+    XrSpaceLocation location = {.type = XR_TYPE_SPACE_LOCATION};
+    xrLocateSpace(xr_space_view, xr_space_stage,
+                  frame_state.predictedDisplayTime, &location);
+    auto o = location.pose.orientation;
+    auto p = location.pose.position;
+    stage_view_pose = RigidTransform{
+        .rotation = quat(o.w, o.x, o.y, o.z),
+        .translation = vec3(p.x, p.y, p.z),
+    };
+  }
+
+  // previous_inputs
+  // inputs
+  {
+    previous_inputs = inputs;
+    XrActiveActionSet activeSet = {
+        .actionSet = gameplayActionSet,
+    };
+
+    XrActionsSyncInfo syncInfo = {
+        .type = XR_TYPE_ACTIONS_SYNC_INFO,
+        .countActiveActionSets = 1,
+        .activeActionSets = &activeSet,
+    };
+    auto r = xrSyncActions(session, &syncInfo);
+    if (r < 0) {
+      LOGE("SyncActions returned an error %d\n", r);
+    }
+
+    XrActionStateVector2f right_move_state = {
+        .type = XR_TYPE_ACTION_STATE_VECTOR2F,
+    };
+
+    XrActionStateGetInfo right_get_action_info = {
+        .type = XR_TYPE_ACTION_STATE_GET_INFO,
+        .action = move_action,
+        .subactionPath = rightHandPath,
+    };
+
+    CHECK_XR(xrGetActionStateVector2f(session, &right_get_action_info,
+                                      &right_move_state));
+
+    XrActionStateVector2f left_move_state = {
+        .type = XR_TYPE_ACTION_STATE_VECTOR2F,
+    };
+
+    XrActionStateGetInfo left_get_action_info = {
+        .type = XR_TYPE_ACTION_STATE_GET_INFO,
+        .action = move_action,
+        .subactionPath = leftHandPath,
+    };
+
+    CHECK_XR(xrGetActionStateVector2f(session, &left_get_action_info,
+                                      &left_move_state));
+
+    XrActionStateBoolean capture_frame_state = {
+        .type = XR_TYPE_ACTION_STATE_BOOLEAN,
+    };
+
+    XrActionStateGetInfo capture_frame_state_info = {
+        .type = XR_TYPE_ACTION_STATE_GET_INFO,
+        .action = capture_frame_action,
+        .subactionPath = rightHandPath,
+    };
+
+    CHECK_XR(xrGetActionStateBoolean(session, &capture_frame_state_info,
+                                     &capture_frame_state));
+
+    inputs = {
+        .right_move = right_move_state,
+        .left_move = left_move_state,
+        .capture_frame = capture_frame_state,
+        .right_move_horizental_triggered =
+            abs(right_move_state.currentState.x) > input_trigger_threshold,
+    };
+  }
+
+  {
+    constexpr float camera_translation_speed = 1e-9; // in m/ns
+
+    RigidTransform stage_view_pose_prime = {
+        .rotation = removePitchRoll(stage_view_pose.rotation),
+        .translation = stage_view_pose.translation,
+    };
+
+    if (inputs.right_move.isActive && inputs.right_move_horizental_triggered &&
+        !previous_inputs.right_move_horizental_triggered) {
+      if (inputs.right_move.currentState.x > 0) {
+        auto minus_30_y = quat(0.9659258, 0, -0.2588192, 0);
+        RigidTransform new_pose = {
+            .rotation = minus_30_y,
+            .translation = vec3(0, 0, 0),
+        };
+
+        tracking_origin_pose = compose_transfrom(
+            tracking_origin_pose,
+            compose_transfrom(
+                stage_view_pose_prime,
+                compose_transfrom(new_pose,
+                                  inverse_transform(stage_view_pose_prime))));
+
+      } else {
+        auto plus_30_y = quat(0.9659258, 0, 0.2588192, 0);
+        RigidTransform new_pose = {
+            .rotation = plus_30_y,
+            .translation = vec3(0, 0, 0),
+        };
+        tracking_origin_pose = compose_transfrom(
+            tracking_origin_pose,
+            compose_transfrom(
+                stage_view_pose_prime,
+                compose_transfrom(new_pose,
+                                  inverse_transform(stage_view_pose_prime))));
+      }
+    }
+
+    if (inputs.left_move.isActive) {
+      auto displacement = camera_translation_speed * frame_duration;
+
+      RigidTransform new_pose = {
+          .rotation = quat(1.0, 0, 0, 0),
+          .translation =
+              vec3(inputs.left_move.currentState.x * displacement, 0,
+                   -(inputs.left_move.currentState.y * displacement)),
+      };
+      tracking_origin_pose = compose_transfrom(
+          tracking_origin_pose,
+          compose_transfrom(
+              stage_view_pose_prime,
+              compose_transfrom(new_pose,
+                                inverse_transform(stage_view_pose_prime))));
+    }
+
+    if (inputs.capture_frame.currentState) {
+      capture_frame = true; // this will start the capture next frame
+    }
   }
 
   for (uint32_t i = 0; i < viewCount; i++) {
@@ -665,15 +883,43 @@ uint32_t tick() {
                             3, // setCount
                             sets, 0, nullptr);
 
-    auto orientation = views[i].pose.orientation;
-    auto pos = views[i].pose.position;
+    RigidTransform eye_transform;
+    {
+      auto o = views[i].pose.orientation;
+      auto p = views[i].pose.position;
+      // LOGI("view[%d]: %f,%f,%f\n", i, p.x, p.y, p.z);
+      // LOGI("view_orientation[%d]: w%f, %f,%f,%f\n", i, o.w, o.x, o.y, o.z);
+
+      RigidTransform stage_eye_transform = {
+          .rotation = quat(o.w, o.x, o.y, o.z),
+          .translation = vec3(p.x, p.y, p.z),
+      };
+
+      // tracking_origin_pose = {.rotation = quat(1, 0, 0, 0),
+      //                         .translation = vec3(0, 0, 0)};
+      // stage_eye_transform = {
+      //     .rotation = quat(1, 0, 0, 0),
+      //     .translation = vec3(1, 2, 3),
+      // };
+      //  auto r = quat(0, 0, 0, 1) * vec3(1, 2, 3);
+
+      // LOGI("r:%f,%f,%f", r.x, r.y, r.z);
+      eye_transform =
+          compose_transfrom(tracking_origin_pose, stage_eye_transform);
+      // eye_transform = stage_eye_transform;
+    }
+
     RenderingPushConstant rendering_push_constant = {
-        .camera_orientation = {orientation.x, orientation.y, orientation.z,
-                               orientation.w},
+        .camera_orientation = {eye_transform.rotation.x,
+                               eye_transform.rotation.y,
+                               eye_transform.rotation.z,
+                               eye_transform.rotation.w},
         //.camera_orientation = {-0.3826834, 0, 0, 0.9238796}, // -45 X
         //.camera_orientation = {0, 0, 0, 1}, // -45 X
-        .camera_pos = {pos.x + 0.5f, pos.y - 0.8f,
-                       pos.z + 0.5f}, // TODO, offset just for debugging
+        .camera_pos = {eye_transform.translation.x, eye_transform.translation.y,
+                       eye_transform.translation.z},
+        //.camera_pos = {pos.x + 0.5f, pos.y - 0.8f,
+        //               pos.z + 0.5f}, // TODO, offset just for debugging
         //.camera_pos = {0.05, 0.2, 0.2},
         //.camera_pos = {0, 0, 0.4},
         .tanLeft = (float)tan(views[i].fov.angleLeft),
@@ -857,8 +1103,11 @@ uint32_t tick() {
 
   CHECK_XR(xrEndFrame(session, &frame_end_info));
 
-  if (renderdoc_api)
+  if (renderdoc_api && frame_capture_ongoing) {
     renderdoc_api->EndFrameCapture(NULL, NULL);
+    frame_capture_ongoing = false;
+    capture_frame = false;
+  }
 
   return 0;
 }
@@ -1265,6 +1514,14 @@ extern "C" int engine_main(
     };
     CHECK_XR(xrCreateReferenceSpace(session, &xr_reference_space_create_info,
                                     &xr_space_stage));
+
+    XrReferenceSpaceCreateInfo xr_reference_space_view_create_info = {
+        .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO,
+        .referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW,
+        .poseInReferenceSpace = xr_pose_identity,
+    };
+    CHECK_XR(xrCreateReferenceSpace(
+        session, &xr_reference_space_view_create_info, &xr_space_view));
   }
 
   {
@@ -1693,6 +1950,99 @@ extern "C" int engine_main(
                                     &rendering_descriptor_pool));
   }
 
+  // openxr actions (input system)
+  {
+
+    XrActionSetCreateInfo actionSetInfo = {
+        .type = XR_TYPE_ACTION_SET_CREATE_INFO,
+        .actionSetName = "gameplay",
+        .localizedActionSetName = "Gameplay",
+        .priority = 0,
+    };
+
+    CHECK_XR(xrCreateActionSet(instance, &actionSetInfo, &gameplayActionSet));
+
+    CHECK_XR(xrStringToPath(instance, "/user/hand/left", &leftHandPath));
+    CHECK_XR(xrStringToPath(instance, "/user/hand/right", &rightHandPath));
+
+    XrPath handSubactionPaths[] = {leftHandPath, rightHandPath};
+
+    XrActionCreateInfo move_action_info = {
+        .type = XR_TYPE_ACTION_CREATE_INFO,
+        .actionName = "move",
+        .actionType = XR_ACTION_TYPE_VECTOR2F_INPUT,
+        .countSubactionPaths = 2,
+        .subactionPaths = handSubactionPaths,
+        .localizedActionName = "Move",
+    };
+
+    CHECK_XR(
+        xrCreateAction(gameplayActionSet, &move_action_info, &move_action));
+
+    XrActionCreateInfo capture_frame_action_info = {
+        .type = XR_TYPE_ACTION_CREATE_INFO,
+        .actionName = "capture_frame",
+        .actionType = XR_ACTION_TYPE_BOOLEAN_INPUT,
+        .countSubactionPaths = 2,
+        .subactionPaths = handSubactionPaths,
+        .localizedActionName = "Capture Frame",
+    };
+
+    CHECK_XR(xrCreateAction(gameplayActionSet, &capture_frame_action_info,
+                            &capture_frame_action));
+
+    {
+      XrPath thumbstick_left_path;
+      CHECK_XR(xrStringToPath(instance, "/user/hand/left/input/thumbstick",
+                              &thumbstick_left_path));
+
+      XrPath thumbstick_right_path;
+      CHECK_XR(xrStringToPath(instance, "/user/hand/right/input/thumbstick",
+                              &thumbstick_right_path));
+
+      XrPath button_b_path;
+      CHECK_XR(xrStringToPath(instance, "/user/hand/right/input/b/click",
+                              &button_b_path));
+
+      XrActionSuggestedBinding bindings[] = {
+          {
+              .action = move_action,
+              .binding = thumbstick_left_path,
+          },
+          {
+              .action = move_action,
+              .binding = thumbstick_right_path,
+          },
+          {
+              .action = capture_frame_action,
+              .binding = button_b_path,
+          },
+      };
+
+      XrPath interactionProfilePath;
+      CHECK_XR(xrStringToPath(instance,
+                              "/interaction_profiles/oculus/touch_controller",
+                              &interactionProfilePath));
+
+      XrInteractionProfileSuggestedBinding suggested = {
+          .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+          .interactionProfile = interactionProfilePath,
+          .countSuggestedBindings = 3,
+          .suggestedBindings = bindings,
+      };
+
+      CHECK_XR(xrSuggestInteractionProfileBindings(instance, &suggested));
+    }
+
+    XrSessionActionSetsAttachInfo attachInfo = {
+        .type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO,
+        .countActionSets = 1,
+        .actionSets = &gameplayActionSet,
+    };
+
+    CHECK_XR(xrAttachSessionActionSets(session, &attachInfo));
+  }
+
   // initialize rendering related resources
   {
     CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
@@ -1882,6 +2232,12 @@ extern "C" int engine_main(
     vkQueueWaitIdle(vkQueue);
   }
 
+  tracking_origin_pose = RigidTransform{
+      .rotation = glm::quat(1.0, 0.0, 0.0, 0.0),
+      .translation = glm::vec3(0.5, 0.0, 0.5),
+      //.translation = glm::vec3(0.0, 0.0, 0.0),
+  };
+
   // end of initialization
 
 #ifdef XR_USE_PLATFORM_ANDROID
@@ -1891,6 +2247,8 @@ extern "C" int engine_main(
 #endif
     tick();
   }
+
+  LOGI("last frame_duration:%ld", frame_duration);
 
   // TODO: we should cleanup properly, android reuses the same process for
   // mulitple app invocation, we might have leftover state

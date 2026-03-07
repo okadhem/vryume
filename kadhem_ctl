@@ -38,17 +38,21 @@ function install
     adb shell run-as $package "cp -R /data/local/tmp/assets files/"; or return
 end
 
-function run
-    if adb shell run-as $package "pkill vryume"
-        echo "Info: killed running vryume process"
-    end
-    make android_debug; or return
-    install; or return
-    adb shell "am start -n com.kadhem.vryume/.MainActivity"; or return
-    echo "Running: logcat -s vryume"; or return
-    adb logcat -s vryume; or return
-end
+# function run
+#     if adb shell run-as $package "pkill vryume"
+#         echo "Info: killed running vryume process"
+#     end
+#     make android_debug; or return
+#     install; or return
+#     adb shell "am start -n com.kadhem.vryume/.MainActivity"; or return
+#     echo "Running: logcat -s vryume"; or return
+#     adb logcat -s vryume; or return
+# end
 
+function run
+    make; or return
+    ./build/game_exe
+end
 
 function run_lldb_server
     set local_symbols "./build/libengine_debug.so"

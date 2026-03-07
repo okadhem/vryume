@@ -52,7 +52,8 @@ float model_signed_distance(vec3 pos) {
     float d = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.60,0.05,0.05));
     float e = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.05,0.60,0.05));
     float f = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.05,0.05,0.60));
-    return sphere_at_origin(pos, 0.1);
+    //return sphere_at_origin(pos, 0.1);
+    return min(min(min(min(min(zero,a),b),c),f),e); // x axis has one box, z has 2
     //return min(min(min(min(min(min(zero,a),b),c),d),e),f);
     //return min(min(min(zero,a),b),c);
 }

@@ -20,8 +20,8 @@ layout(
 ) uniform sampler3D tile_image;
 
 layout(std430, push_constant) uniform PushConstant {
-    vec4 camera_orientation; // normalized quat
-    vec3 camera_pos;
+    vec4 camera_orientation_world; // normalized quat
+    vec3 camera_position_world;
     float tanLeft;
     float tanRight;
     float tanUp;
@@ -83,11 +83,11 @@ vec3 vector_world_to_tile(vec3 v) {
     return v;
 }
 vec3 vector_eye_to_world(vec3 v) {
-    return rotate_by_quat(pc.camera_orientation, v);
+    return rotate_by_quat(pc.camera_orientation_world, v);
 }
 
 vec3 point_world_to_eye(vec3 p) {
-    return rotate_by_quat(inverse_unit_quat(pc.camera_orientation), p - pc.camera_pos);
+    return rotate_by_quat(inverse_unit_quat(pc.camera_orientation_world), p - pc.camera_position_world);
 }
 
 vec3 point_model_to_world(vec3 p) {
@@ -148,7 +148,7 @@ void main() {
     }
 
     vec3 ray_direction_tile = vector_world_to_tile(ray_direction_world);
-    vec3 ray_origin_tile = point_world_to_tile(pc.camera_pos);
+    vec3 ray_origin_tile = point_world_to_tile(pc.camera_position_world);
 
     vec3 ray_tip = ray_origin_tile;
     bool out_of_tile = false;

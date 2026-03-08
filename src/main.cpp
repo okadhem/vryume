@@ -126,17 +126,18 @@ static VkSampler rendering_tile_sampler;
 static RENDERDOC_API_1_4_1 *renderdoc_api = nullptr;
 static bool capture_frame = false;
 
+// the transform is the rotation followed by the translation
 struct RigidTransform {
-  glm::quat rotation;
-  glm::vec3 translation;
+  quat rotation;
+  vec3 translation;
 };
 
 // world space pose of the VR play area, this is the area where the camera
-// can move following headset motionw
-static RigidTransform tracking_origin_pose;
+// can move following headset motion
+static RigidTransform stage_pose_world;
 
 // space attached to the headset, this is the stage head pose
-static RigidTransform stage_view_pose;
+static RigidTransform head_pose_stage;
 
 // TODO: this is shared with the shader, and as such we should define it
 // somewhere global not duplciate it
@@ -424,14 +425,15 @@ struct InputState {
   XrActionStateVector2f left_move;
   XrActionStateBoolean capture_frame;
   bool right_move_horizental_triggered;
+  bool right_move_vertical_triggered;
 };
 // after how much is the continuous input considered triggered
 constexpr float input_trigger_threshold = 0.8;
 static InputState inputs = {};
 static InputState previous_inputs = {};
 struct RenderingPushConstant {
-  float camera_orientation[4];
-  float camera_pos[3];
+  float camera_orientation_world[4];
+  float camera_position_world[3];
   float tanLeft; // starts at 28
   float tanRight;
   float tanUp;
@@ -638,7 +640,7 @@ uint32_t tick() {
                   frame_state.predictedDisplayTime, &location);
     auto o = location.pose.orientation;
     auto p = location.pose.position;
-    stage_view_pose = RigidTransform{
+    head_pose_stage = RigidTransform{
         .rotation = quat(o.w, o.x, o.y, o.z),
         .translation = vec3(p.x, p.y, p.z),
     };
@@ -707,64 +709,56 @@ uint32_t tick() {
         .capture_frame = capture_frame_state,
         .right_move_horizental_triggered =
             abs(right_move_state.currentState.x) > input_trigger_threshold,
+        .right_move_vertical_triggered =
+            abs(right_move_state.currentState.y) > input_trigger_threshold,
     };
   }
 
+  // responding to inputs
   {
     constexpr float camera_translation_speed = 1e-9; // in m/ns
 
-    RigidTransform stage_view_pose_prime = {
-        .rotation = removePitchRoll(stage_view_pose.rotation),
-        .translation = stage_view_pose.translation,
+    RigidTransform head_vertical_pose_stage = {
+        .rotation = removePitchRoll(head_pose_stage.rotation),
+        .translation = head_pose_stage.translation,
     };
+
+    RigidTransform new_pose = {.rotation = quat(1, 0, 0, 0),
+                               .translation = vec3(0)};
 
     if (inputs.right_move.isActive && inputs.right_move_horizental_triggered &&
         !previous_inputs.right_move_horizental_triggered) {
+
       if (inputs.right_move.currentState.x > 0) {
         auto minus_30_y = quat(0.9659258, 0, -0.2588192, 0);
-        RigidTransform new_pose = {
-            .rotation = minus_30_y,
-            .translation = vec3(0, 0, 0),
-        };
-
-        tracking_origin_pose = compose_transfrom(
-            tracking_origin_pose,
-            compose_transfrom(
-                stage_view_pose_prime,
-                compose_transfrom(new_pose,
-                                  inverse_transform(stage_view_pose_prime))));
-
+        new_pose.rotation = minus_30_y;
       } else {
         auto plus_30_y = quat(0.9659258, 0, 0.2588192, 0);
-        RigidTransform new_pose = {
-            .rotation = plus_30_y,
-            .translation = vec3(0, 0, 0),
-        };
-        tracking_origin_pose = compose_transfrom(
-            tracking_origin_pose,
-            compose_transfrom(
-                stage_view_pose_prime,
-                compose_transfrom(new_pose,
-                                  inverse_transform(stage_view_pose_prime))));
+        new_pose.rotation = plus_30_y;
       }
+    }
+
+    vec3 translation = vec3(0);
+    if (inputs.right_move.isActive && inputs.right_move_vertical_triggered) {
+      auto displacement = camera_translation_speed * frame_duration;
+      translation +=
+          vec3(0, inputs.right_move.currentState.y * displacement, 0);
     }
 
     if (inputs.left_move.isActive) {
       auto displacement = camera_translation_speed * frame_duration;
-
-      RigidTransform new_pose = {
-          .rotation = quat(1.0, 0, 0, 0),
-          .translation =
-              vec3(inputs.left_move.currentState.x * displacement, 0,
-                   -(inputs.left_move.currentState.y * displacement)),
-      };
-      tracking_origin_pose = compose_transfrom(
-          tracking_origin_pose,
-          compose_transfrom(
-              stage_view_pose_prime,
-              compose_transfrom(new_pose,
-                                inverse_transform(stage_view_pose_prime))));
+      translation += vec3(inputs.left_move.currentState.x * displacement, 0,
+                          -(inputs.left_move.currentState.y * displacement));
     }
+
+    new_pose.translation = translation;
+
+    stage_pose_world = compose_transfrom(
+        stage_pose_world,
+        compose_transfrom(
+            head_vertical_pose_stage,
+            compose_transfrom(new_pose,
+                              inverse_transform(head_vertical_pose_stage))));
 
     if (inputs.capture_frame.currentState) {
       capture_frame = true; // this will start the capture next frame
@@ -883,45 +877,27 @@ uint32_t tick() {
                             3, // setCount
                             sets, 0, nullptr);
 
-    RigidTransform eye_transform;
+    RigidTransform eye_pose_world;
     {
       auto o = views[i].pose.orientation;
       auto p = views[i].pose.position;
-      // LOGI("view[%d]: %f,%f,%f\n", i, p.x, p.y, p.z);
-      // LOGI("view_orientation[%d]: w%f, %f,%f,%f\n", i, o.w, o.x, o.y, o.z);
 
-      RigidTransform stage_eye_transform = {
+      RigidTransform eye_pose_stage = {
           .rotation = quat(o.w, o.x, o.y, o.z),
           .translation = vec3(p.x, p.y, p.z),
       };
 
-      // tracking_origin_pose = {.rotation = quat(1, 0, 0, 0),
-      //                         .translation = vec3(0, 0, 0)};
-      // stage_eye_transform = {
-      //     .rotation = quat(1, 0, 0, 0),
-      //     .translation = vec3(1, 2, 3),
-      // };
-      //  auto r = quat(0, 0, 0, 1) * vec3(1, 2, 3);
-
-      // LOGI("r:%f,%f,%f", r.x, r.y, r.z);
-      eye_transform =
-          compose_transfrom(tracking_origin_pose, stage_eye_transform);
-      // eye_transform = stage_eye_transform;
+      eye_pose_world = compose_transfrom(stage_pose_world, eye_pose_stage);
     }
 
     RenderingPushConstant rendering_push_constant = {
-        .camera_orientation = {eye_transform.rotation.x,
-                               eye_transform.rotation.y,
-                               eye_transform.rotation.z,
-                               eye_transform.rotation.w},
-        //.camera_orientation = {-0.3826834, 0, 0, 0.9238796}, // -45 X
-        //.camera_orientation = {0, 0, 0, 1}, // -45 X
-        .camera_pos = {eye_transform.translation.x, eye_transform.translation.y,
-                       eye_transform.translation.z},
-        //.camera_pos = {pos.x + 0.5f, pos.y - 0.8f,
-        //               pos.z + 0.5f}, // TODO, offset just for debugging
-        //.camera_pos = {0.05, 0.2, 0.2},
-        //.camera_pos = {0, 0, 0.4},
+        .camera_orientation_world = {eye_pose_world.rotation.x,
+                                     eye_pose_world.rotation.y,
+                                     eye_pose_world.rotation.z,
+                                     eye_pose_world.rotation.w},
+        .camera_position_world = {eye_pose_world.translation.x,
+                                  eye_pose_world.translation.y,
+                                  eye_pose_world.translation.z},
         .tanLeft = (float)tan(views[i].fov.angleLeft),
         .tanRight = (float)tan(views[i].fov.angleRight),
         .tanUp = (float)tan(views[i].fov.angleUp),
@@ -2232,10 +2208,9 @@ extern "C" int engine_main(
     vkQueueWaitIdle(vkQueue);
   }
 
-  tracking_origin_pose = RigidTransform{
+  stage_pose_world = RigidTransform{
       .rotation = glm::quat(1.0, 0.0, 0.0, 0.0),
-      .translation = glm::vec3(0.5, 0.0, 0.5),
-      //.translation = glm::vec3(0.0, 0.0, 0.0),
+      .translation = glm::vec3(0.0, 0.0, 0.0),
   };
 
   // end of initialization

@@ -1,5 +1,5 @@
 #version 450
-
+#define DEBUG_MEASURE_ERROR
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(
@@ -31,6 +31,7 @@ layout(std430, push_constant) uniform PushConstant {
     vec2 resolution; // (width,height)
 } pc;
 
+#include "common.h.glsl"
 
 //TODO double check
 // q normalized quaternion
@@ -43,31 +44,44 @@ vec4 inverse_unit_quat(vec4 q) {
     return vec4(-q.x,-q.y,-q.z,q.w);
 }
 
-//TODO thoese two need to be a define
-const float encoded_distance_resolution = 0.0005; // in m
-const float max_representable_distance = 255.0 * encoded_distance_resolution; // in m
-float decode_distance(float sampled_distance) {
-    return sampled_distance * max_representable_distance;
+//#### this section is copy pasta from the evaluation shader, best we can do now because we don't have an include
+
+float sphere_at_origin(vec3 pos, float r) {
+    return length(pos) - r;
 }
 
-float sdf_norm(vec3 p_norm) {
-    return decode_distance(texture(tile_image, p_norm).r);
-}
-
-float sdf(vec3 p) {
-    vec3 p_norm = p / pc.tile_extent;
-    return sdf_norm(p_norm);
-}
-
-const float h = 1e-4; // TODO define somewhere
-vec3 sdf_grad(vec3 p) // from chatgpt
+float sdBox( vec3 p, vec3 b )
 {
-    return vec3(
-        sdf(p + vec3(h,0,0)) - sdf(p - vec3(h,0,0)),
-        sdf(p + vec3(0,h,0)) - sdf(p - vec3(0,h,0)),
-        sdf(p + vec3(0,0,h)) - sdf(p - vec3(0,0,h))
-    ) / (2.0 * h);
+  vec3 q = abs(p) - b;
+  return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);
 }
+
+float transformed_box(vec3 p, vec4 unit_quat, vec3 translation)
+{
+    return sdBox(rotate_by_quat(inverse_unit_quat(unit_quat), p - translation), vec3(0.1,0.1,0.1));
+}
+
+float sdf_union(float a, float b) {
+    return min(a,b);
+}
+
+
+//pos in model space
+//returns distance in meters
+float model_signed_distance(vec3 pos) {
+    float zero = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.05,0.05,0.05));
+    float a = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.35,0.05,0.05));
+    float b = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.05,0.35,0.05));
+    float c = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.05,0.05,0.35));
+    float d = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.60,0.05,0.05));
+    float e = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.05,0.60,0.05));
+    float f = transformed_box(pos, vec4(0.0, 0.0, 0.0, 1.0), vec3(0.05,0.05,0.60));
+    return sphere_at_origin(pos, 0.1);
+    //return min(min(min(min(min(zero,a),b),c),f),e); // x axis has one box, z has 2
+    //return min(min(min(min(min(min(zero,a),b),c),d),e),f);
+    //return min(min(min(zero,a),b),c);
+}
+//#### end section
 
 
 vec3 vector_tile_to_world(vec3 v) {
@@ -104,6 +118,60 @@ vec3 point_tile_to_world(vec3 p) {
 vec3 point_world_to_tile(vec3 p) {
     return point_world_to_model(p) - pc.tile_pos;
 }
+vec3 point_tile_to_model(vec3 p) {
+    return pc.tile_pos + p;
+}
+
+
+float debug_max_error = 0;
+float sdf_norm(vec3 p_norm) {
+    float result = decode_distance(texture(tile_image, p_norm).r);
+#ifdef DEBUG_MEASURE_ERROR
+    float original_distance = model_signed_distance(point_tile_to_model(p_norm * pc.tile_extent));
+    float error = abs(original_distance - result); 
+    if (original_distance <= max_representable_distance && error > debug_max_error) {
+        debug_max_error = error;
+    }
+    //return original_distance;
+#endif
+    return result;
+}
+
+float sdf(vec3 p) {
+    vec3 p_norm = p / pc.tile_extent;
+    return sdf_norm(p_norm);
+}
+
+
+// NOTE: changes to grad function need to be reflected in max_surface_penetration (common.h.glsl)
+vec3 sdf_grad_old(vec3 p) // from chatgpt
+{
+    return vec3(
+        sdf(p + vec3(grad_epsilon,0,0)) - sdf(p - vec3(grad_epsilon,0,0)),
+        sdf(p + vec3(0,grad_epsilon,0)) - sdf(p - vec3(0,grad_epsilon,0)),
+        sdf(p + vec3(0,0,grad_epsilon)) - sdf(p - vec3(0,0,grad_epsilon))
+    ) / (2.0 * grad_epsilon);
+}
+
+
+vec3 sdf_grad(vec3 p)
+{
+    // TODO: can't we normalize these vectors ? that way grad_epsilon would break;
+    // the actual epsilon
+    vec3 k1 = vec3(1,-1,-1);
+    vec3 k2 = vec3(-1,-1,1);
+    vec3 k3 = vec3(-1,1,-1);
+    vec3 k4 = vec3(1,1,1);
+
+    vec3 n = k1*sdf(p + k1 * grad_epsilon) +
+        k2*sdf(p + k2 * grad_epsilon) +
+        k3*sdf(p + k3 * grad_epsilon) +
+        k4*sdf(p + k4 * grad_epsilon);
+
+    return normalize(n);
+}
+
+
 
 
 const float zero_distance = 0.001;
@@ -192,5 +260,6 @@ void main() {
     imageStore(color_image, pixel_coord, vec4(color, 1.0));
 
     float depth = -point_world_to_eye(point_tile_to_world(ray_tip)).z;
+    // depth = debug_max_error; 
     imageStore(depth_image, pixel_coord, vec4(depth, 0.0, 0.0, 0.0));  // only x matters, 0 is near plane
 }

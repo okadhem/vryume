@@ -139,8 +139,8 @@ static RigidTransform stage_pose_world;
 // space attached to the headset, this is the stage head pose
 static RigidTransform head_pose_stage;
 
-// TODO: this is shared with the shader, and as such we should define it
-// somewhere global not duplciate it
+// TODO: Keep in sync with the one in glsl until we use a global define or some
+// solution
 constexpr float inter_sample_distance = 0.002; // in m
 char *slow_concat(const char *a, const char *b) {
   size_t len_a = strlen(a);

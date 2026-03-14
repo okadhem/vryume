@@ -58,7 +58,7 @@ desktop_debug: $(OBJ_DIR) $(SHADER_OBJ_DIR) $(OBJ) $(COMP_SHADERS_OBJ)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(SHADER_OBJ_DIR)/%.spv: $(SRC_DIR)/%.comp
+$(SHADER_OBJ_DIR)/%.spv: $(SRC_DIR)/%.comp $(SRC_DIR)/*.h.glsl
 	$(GLSLC) $(GLSLCFLAGS) -c $< -o $@
 
 

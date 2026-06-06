@@ -1,0 +1,146 @@
+#version 450
+// this shader runs per voxel, we identify a voxel with its low x,y,z corner.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+struct Edit {
+    bool is_removal;
+    int material_id;
+    int primitive_type;
+    float param[4];
+
+    // transform in model space
+    vec4 rotation; // unit quaternion
+    vec3 translation;
+}
+const int STEP_1_SURFACE = 0;
+const int STEP_2_SURFACE = 1;
+const int STEP_3_SURFACE = 2;
+
+uniform Edit edit_list[4];
+uniform int edit_list_size;
+
+layout(push_constant) uniform PushConstant {
+    vec3 tile_pos; // in model space
+    int step; // one of STEP_XXX, how many sub surface we should encode in this shader run. each step assumes the steps before are done.
+} push_constant;
+
+layout(
+set = 0,
+binding = 1, //TODO double check
+r8
+) uniform uimage3D tile_voxel_material;
+
+layout(
+set = 0,
+binding = 0,
+r8
+) uniform readonly image3D tile_sdf_image;
+
+// evaluate the primitive geometry regardless of if it is a removal or addition.
+flaot evaluate_primitive(Edit edit, vec3 pos) {
+    return 0;
+}
+
+// calculate the sdf values in a specific order
+float[8] evaluate_primitive_voxel(Edit edit, vec3 voxel_corner) {
+    float[8] result;
+    result[0] = evaluate_primitive(edit, voxel_corner);
+    result[1] = evaluate_primitive(edit, voxel_corner + vec3(inter_sample_distance, 0, 0));
+    result[2] = evaluate_primitive(edit, voxel_corner + vec3(0, inter_sample_distance, 0));
+    result[3] = evaluate_primitive(edit, voxel_corner + vec3(inter_sample_distance, inter_sample_distance, 0));
+    result[4] = evaluate_primitive(edit, voxel_corner + vec3(0, 0, inter_sample_distance));
+    result[5] = evaluate_primitive(edit, voxel_corner + vec3(inter_sample_distance, 0, inter_sample_distance));
+    result[6] = evaluate_primitive(edit, voxel_corner + vec3(0, inter_sample_distance, inter_sample_distance));
+    result[7] = evaluate_primitive(edit, voxel_corner + vec3(inter_sample_distance, inter_sample_distance, inter_sample_distance));
+
+    return result;
+}
+
+// zero is both negative and positive
+bool same_sign(flaot[8] fs) {
+    //TODO
+}
+
+// The invariant that must be respected when deciding what surface each channel encodes is that a voxel should always
+// agree with its neighbours on the mapping of all the channels: if the neighbour voxel uses the channel, it must
+// map it to the same surface we are mapping it to. (the reason is shared sample point have to agree on the same distance value).
+
+// each voxel material byte is made of a header and a payload:
+// header (bit 0 and 1): ONE_SURFACE_VOXEL, TWO_SURFACE_VOXEL_1, TWO_SURFACE_VOXEL_2, THREE_SURFACE_VOXEL
+// ONE_SURFACE_VOXEL, payload(bit 2 to 7) = material_id
+// in the case of two surfaces on a voxel, we have 3 different configurations:
+// - 12: surfaces are on channel 1 and 2
+// - 13: surfaces are on channel 1 and 3
+// - 23: surfaces are on channel 2 and 3
+// first bit of payload(bit) will be used to split TWO_SURFACE_VOXEL_1 and TWO_SURFACE_VOXEL_2 in to two sub spaces
+// TWO_SURFACE_VOXEL_1 with bit2 = 0 => configuration 12
+// TWO_SURFACE_VOXEL_1 with bit2 = 1 => configuration 13
+// TWO_SURFACE_VOXEL_2 with bit2 = 0 => configuration 23
+// TWO_SURFACE_VOXEL_2 with bit2 = 1 => unused
+// in all cases, the remaining 5 bits will be the index of the neighbour with the lower channel number,
+// i.e for configuration 12 the neighbour index of the surface mapped by channel 1.
+// THREE_SURFACE_VOXEL, nothing in payload
+
+void write_first_surface(flaot[8] sdf, int material_id) {}
+void write_second_surface(flaot[8] sdf, int material_id) {}
+void write_thrird_surface(flaot[8] sdf, int material_id) {}
+
+void main() {
+    ivec3 invocation_id = ivec3(gl_GlobalInvocationID.xyz);
+    vec3 invocation_position = push_constant.tile_pos + invocation_id * inter_sample_distance; // in model space
+
+    int surfaces_written = 0;
+
+    float[8] accumulated_removal;
+    for (int i = 0; i < 8; i++) {
+        accumulated_removal[i] = MIN_FLOAT;
+    }
+
+    for (int edit_id = edit_list_size - 1; edit_id >= 0; edit_id--) {
+        Edit edit = edit_list[edit_id];
+        float[8] primitive_voxel_sdf = evaluate_primitive_voxel(edit, invocation_position);
+        if (edit.is_removal) {
+            for (int i = 0; i < 8; i++) {
+                accumulated_removal[i] = max(accumulated_removal[i], -primitive_voxel_sdf[i])
+            }
+            continue;
+        }
+
+        float[8] primitive_minus_accumulated;
+        for (int i = 0; i < 8; i++) {
+            primitive_minus_accumulated[i] = max(accumulated_removal[i], primitive_voxel_sdf[i])
+        }
+        if (!same_sign(primitive_minus_accumulated)) {
+            // we hit a primitive, primitive_minus_accumulated is the sdf.
+            switch (step) {
+                case STEP_1_SURFACE:
+                write_first_surface(primitive_minus_accumulated, edit.material_id);
+                return;
+                break;
+
+                case STEP_2_SURFACE:
+                if (surfaces_written < 1) {
+                    // first surface is assumed written in previous step, we do nothing
+                    surfaces_written += 1;
+                } else {
+                    write_second_surface(primitive_minus_accumulated, edit.material_id);
+                    return;
+                }
+                break;
+
+                case STEP_3_SURFACE:
+                if (surfaces_written < 2) {
+                    // first surface and second surfaces are written in previous step, we do nothing
+                    surfaces_written += 1;
+                } else {
+                    write_thrid_surface(primitive_minus_accumulated, edit.material_id);
+                    return;
+                }
+            }
+        }
+        for (int i = 0; i < 8; i++) {
+            accumulated_removal[i] = max(accumulated_removal[i], -primitive_voxel_sdf[i])
+        }
+    }
+}

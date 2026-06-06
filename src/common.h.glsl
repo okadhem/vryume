@@ -31,3 +31,4 @@ float decode_distance(float sampled_distance) {
              sampled_distance);
 }
 
+const float MIN_FLOAT = -3.402823e38;

@@ -62,29 +62,93 @@ bool same_sign(flaot[8] fs) {
     //TODO
 }
 
+// Each voxel material byte is made of a header and a payload:
+// header (bit 0 and 1): ONE_SURFACE_VOXEL, TWO_SURFACE_VOXEL_1, TWO_SURFACE_VOXEL_2, THREE_SURFACE_VOXEL
+// ONE_SURFACE_VOXEL, payload(bit 2 to 7) = material_id
+// in the case of two surfaces on a voxel, we have 3 different configurations:
+// - C12: surfaces are on channel 1 and 2
+// - C13: surfaces are on channel 1 and 3
+// - C23: surfaces are on channel 2 and 3
+// first bit of payload(bit) will be used to split TWO_SURFACE_VOXEL_1 and TWO_SURFACE_VOXEL_2 in to two sub spaces
+// TWO_SURFACE_VOXEL_1 with bit2 = 0 => configuration C12
+// TWO_SURFACE_VOXEL_1 with bit2 = 1 => configuration C13
+// TWO_SURFACE_VOXEL_2 with bit2 = 0 => configuration C23
+// TWO_SURFACE_VOXEL_2 with bit2 = 1 => unused
+// in all cases, the remaining 5 bits will be the index of the neighbour with the lower channel number,
+// i.e for configuration C12 the neighbour index of the surface mapped by channel 1.
+// THREE_SURFACE_VOXEL, nothing in payload
+
 // The invariant that must be respected when deciding what surface each channel encodes is that a voxel should always
 // agree with its neighbours on the mapping of all the channels: if the neighbour voxel uses the channel, it must
 // map it to the same surface we are mapping it to. (the reason is shared sample point have to agree on the same distance value).
 
-// each voxel material byte is made of a header and a payload:
-// header (bit 0 and 1): ONE_SURFACE_VOXEL, TWO_SURFACE_VOXEL_1, TWO_SURFACE_VOXEL_2, THREE_SURFACE_VOXEL
-// ONE_SURFACE_VOXEL, payload(bit 2 to 7) = material_id
-// in the case of two surfaces on a voxel, we have 3 different configurations:
-// - 12: surfaces are on channel 1 and 2
-// - 13: surfaces are on channel 1 and 3
-// - 23: surfaces are on channel 2 and 3
-// first bit of payload(bit) will be used to split TWO_SURFACE_VOXEL_1 and TWO_SURFACE_VOXEL_2 in to two sub spaces
-// TWO_SURFACE_VOXEL_1 with bit2 = 0 => configuration 12
-// TWO_SURFACE_VOXEL_1 with bit2 = 1 => configuration 13
-// TWO_SURFACE_VOXEL_2 with bit2 = 0 => configuration 23
-// TWO_SURFACE_VOXEL_2 with bit2 = 1 => unused
-// in all cases, the remaining 5 bits will be the index of the neighbour with the lower channel number,
-// i.e for configuration 12 the neighbour index of the surface mapped by channel 1.
-// THREE_SURFACE_VOXEL, nothing in payload
+// Three surfaces meet in a voxel, forming three lines meeting in a point.
+// Each surface has an id (material_id), we sort the ids and get the following triplet (S1,S2,S3)
+// each line splits two surfaces, we sort their ids and get the following possibilites
+// L12: S1,S2
+// L23: S2,S3
+// L13: S1,S3
+// we call the intersection voxel P.
+//
+// Each line voxels are initially (at the end of STEP_2_SURFACE) encoded with the channel configuration C12 and lower material_id surface
+// on channel 1, basically one of L12, L23 and L13 even though this numbers don't make sense at STEP_2_SURFACE since we only see
+// two surfaces there not three.
+
+// Rule:
+// - L12/L23/L13 must never be neighbours (no overlapping vertices), all of them use the same two channels
+// for different surfaces and thus voxels should not be touching.
+// - L12/L23/L13 must not be neighbours to P. technically L13 and P are compatible, but L12 and L23
+// are not, and we want an algorithm which will have deterministic results even if we shuffle
+// material_id assignment. this is important as the choice of material_id will be probably done prior to any
+// topology considerations.
+
+// we prepare a version of each of the line encoding called L12' L23' L13', that has two characteristics:
+// - L12' is compatible with L12. (resp. L23' and L13')
+// - L12' L23' L13' are all compatible with each other and compatible with the 3 surface voxel where they all meet.
+// to do that we assign these surfaces to the channels:
+// channel 1 => S1, channel 2 => S3, channel 3 => S2, and therefore
+// P: channel 1 => S1, channel 2 => S3, channel 3 => S2
+// L12': channel 1 => S1, channel 3 => S2
+// L23': channel 2 => S3, channel 3 => S2
+// L13': channel 1 => S1, channel 2 => S3
+
+// we add an extra rule:
+// - L*' should not be neighbouring any L* voxel other than the one naturally associated to it,
+// so L12 with L12' is fine but L12 with L13' or L23' is not. technically speaking not all such
+// combinations are uncompatible, however for the same reason as above, we refrain from relying on that
+// because it would make the algorithm decision depend on an arbitrary material_id assignment.
+
+// The general idea of the algorithm is simply, look at the neighbouring (2surface) voxels to P, up to max radius.
+// if the voxel v has incompatible neighbours, meaning it is close to either P, other L* voxels
+// or to a L*' that is not its compatible prime form, we switch v to its compatible prime form (L12', L13' or L13').
+
+// TODO: we need to find a way to assert if we write a sample with different surfaces distance values.
+
+// returns material ids of voxel v, in ascending material_id order.
+uint8_t[2] read_2_surface_voxel_material_id(ivec3 v) {}
 
 void write_first_surface(flaot[8] sdf, int material_id) {}
 void write_second_surface(flaot[8] sdf, int material_id) {}
-void write_thrird_surface(flaot[8] sdf, int material_id) {}
+
+const MAX_RADIUS = 4 ; // in voxels // TODO find better name
+
+void write_thrird_surface(ivec3 voxel, flaot[8] sdf, int material_id) {
+    for (int r = 0; r <= MAX_RADIUS; r++)
+    {
+        for (int z = -r; z <= r; z++)
+            for (int y = -r; y <= r; y++)
+                for (int x = -r; x <= r; x++)
+                {
+                    // only process the outer shell
+                    if (max(max(abs(x), abs(y)), abs(z)) != r)
+                        continue;
+
+                    ivec3 v = voxel + ivec3(x, y, z);
+
+                    // TODO: bounds check, i think we might not need code here because we are not at texture boundry, but we need to confirm this
+                }
+    }
+}
 
 void main() {
     ivec3 invocation_id = ivec3(gl_GlobalInvocationID.xyz);

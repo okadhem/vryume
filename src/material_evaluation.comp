@@ -63,20 +63,30 @@ bool same_sign(flaot[8] fs) {
 }
 
 // Each voxel material byte is made of a header and a payload:
-// header (bit 0 and 1): ONE_SURFACE_VOXEL, TWO_SURFACE_VOXEL_1, TWO_SURFACE_VOXEL_2, THREE_SURFACE_VOXEL
-// ONE_SURFACE_VOXEL, payload(bit 2 to 7) = material_id
+// header (2 bits): ONE_SURFACE_VOXEL, TWO_SURFACE_VOXEL_1, TWO_SURFACE_VOXEL_2, THREE_SURFACE_VOXEL
+// ONE_SURFACE_VOXEL, payload(6 bits) = material_id
 // in the case of two surfaces on a voxel, we have 3 different configurations:
 // - C12: surfaces are on channel 1 and 2
 // - C13: surfaces are on channel 1 and 3
 // - C23: surfaces are on channel 2 and 3
-// first bit of payload(bit) will be used to split TWO_SURFACE_VOXEL_1 and TWO_SURFACE_VOXEL_2 in to two sub spaces
-// TWO_SURFACE_VOXEL_1 with bit2 = 0 => configuration C12
-// TWO_SURFACE_VOXEL_1 with bit2 = 1 => configuration C13
-// TWO_SURFACE_VOXEL_2 with bit2 = 0 => configuration C23
-// TWO_SURFACE_VOXEL_2 with bit2 = 1 => unused
-// in all cases, the remaining 5 bits will be the index of the neighbour with the lower channel number,
+// one bit of payload will be used to split TWO_SURFACE_VOXEL_1 and TWO_SURFACE_VOXEL_2 in to two sub spaces
+// TWO_SURFACE_VOXEL_1 with config bit = 0 => configuration C12
+// TWO_SURFACE_VOXEL_1 with config bit = 1 => configuration C13
+// TWO_SURFACE_VOXEL_2 with config bit = 0 => configuration C23
+// TWO_SURFACE_VOXEL_2 with config bit = 1 => unused
+// in all 3 cases, the remaining 5 bits will be the index of the neighbour with the lower channel number,
 // i.e for configuration C12 the neighbour index of the surface mapped by channel 1.
 // THREE_SURFACE_VOXEL, nothing in payload
+
+const uint HEADER_MASK = 0b11000000u;
+const uint HEADER_TWO_SURFACE_CONFIG_MASK = 0b11100000u;
+const uint ONE_SURFACE_VOXEL_HEADER = 0b00000000u;
+const uint TWO_SURFACE_VOXEL_1_HEADER = 0b01000000u;
+const uint TWO_SURFACE_VOXEL_C12_CONFIG = 0b01000000u;
+const uint TWO_SURFACE_VOXEL_C13_CONFIG = 0b01100000u;
+const uint TWO_SURFACE_VOXEL_2_HEADER = 0b10000000u;
+const uint TWO_SURFACE_VOXEL_C23_CONFIG = 0b10000000u;
+const uint THREE_SURFACE_VOXEL_HEADER = 0b11000000u;
 
 // The invariant that must be respected when deciding what surface each channel encodes is that a voxel should always
 // agree with its neighbours on the mapping of all the channels: if the neighbour voxel uses the channel, it must
@@ -124,8 +134,21 @@ bool same_sign(flaot[8] fs) {
 
 // TODO: we need to find a way to assert if we write a sample with different surfaces distance values.
 
+// we represent a voxel, channel to surface mapping with a 3 element uint array, where element 0 is
+// the surface mapped to the first channel, etc ..
+// if a channel is not mapped, we represent it with UINT_MAX.
+bool are_mappings_compatible(uint[3] mapping1, uint[3] mapping2) {
+    for (int i = 0; i < 3; i++) {
+        if (mapping1[i] == mapping2[i] || mapping1[i] == UINT_MAX || mapping2[i] == UINT_MAX) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 // returns material ids of voxel v, in ascending material_id order.
-uint8_t[2] read_2_surface_voxel_material_id(ivec3 v) {}
+uint[2] read_2_surface_voxel_material_id(ivec3 v) {}
 
 void write_first_surface(flaot[8] sdf, int material_id) {}
 void write_second_surface(flaot[8] sdf, int material_id) {}
@@ -146,6 +169,20 @@ void write_thrird_surface(ivec3 voxel, flaot[8] sdf, int material_id) {
                     ivec3 v = voxel + ivec3(x, y, z);
 
                     // TODO: bounds check, i think we might not need code here because we are not at texture boundry, but we need to confirm this
+                    uint texel = texelFetch(tile_voxel_material, v, 0).r;
+                    if ((texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C13_CONFIG
+                            || (texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG
+                            || (texel & HEADER_MASK) == THREE_SURFACE_VOXEL_HEADER) {
+                        // this should not happen under the geometry assumtion, 3 line intersection are assumed to be far apart enough that we don't see this.
+                        // TODO: mark the error somewhere
+                        return;
+                    }
+
+                    if ((texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
+                        continue;
+                    }
+
+                    // v is a TWO_SURFACE_VOXEL_C12_CONFIG
                 }
     }
 }

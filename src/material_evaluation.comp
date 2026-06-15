@@ -147,6 +147,15 @@ bool are_mappings_compatible(uint[3] mapping1, uint[3] mapping2) {
     return true;
 }
 
+bool are_mappings_equal(uint[3] mapping1, uint[3] mapping2) {
+    for (int i = 0; i < 3; i++) {
+        if (mapping1[i] != mapping2[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // returns material ids of voxel v, in ascending material_id order.
 uint[2] read_2_surface_voxel_material_id(ivec3 v) {}
 

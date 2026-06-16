@@ -134,6 +134,38 @@ const uint THREE_SURFACE_VOXEL_HEADER = 0b11000000u;
 
 // TODO: we need to find a way to assert if we write a sample with different surfaces distance values.
 
+// sort in assending material order, both the material_id array and the sdfs array.
+material_idoid sort_asc_material_id(inout int material_id[3], inout float[8][3] sdfs)
+{
+    if (material_id[0] > material_id[1]) {
+        int t = material_id[0];
+        material_id[0] = material_id[1];
+        material_id[1] = t;
+
+        float[8] tmp_sdf = sdfs[0];
+        sdfs[0] = sdfs[1];
+        sdfs[1] = tmp_sdf;
+    }
+    if (material_id[1] > material_id[2]) {
+        int t = material_id[1];
+        material_id[1] = material_id[2];
+        material_id[2] = t;
+
+        float[8] tmp_sdf = sdfs[1];
+        sdfs[1] = sdfs[2];
+        sdfs[2] = tmp_sdf;
+    }
+    if (material_id[0] > material_id[1]) {
+        int t = material_id[0];
+        material_id[0] = material_id[1];
+        material_id[1] = t;
+
+        float[8] tmp_sdf = sdfs[0];
+        sdfs[0] = sdfs[1];
+        sdfs[1] = t;
+    }
+}
+
 // we represent a voxel, channel to surface mapping with a 3 element uint array, where element 0 is
 // the surface mapped to the first channel, etc ..
 // if a channel is not mapped, we represent it with UINT_MAX.
@@ -156,15 +188,90 @@ bool are_mappings_equal(uint[3] mapping1, uint[3] mapping2) {
     return true;
 }
 
-// returns material ids of voxel v, in ascending material_id order.
+// sort in assending order.
+void sort2(uint[2] a) {
+    if (a[0] > a[1]) {
+        int t = a[0];
+        a[0] = a[1];
+        a[1] = t;
+    }
+}
+
+// returns material ids of voxel v, in ascending channel order. (example, material_id of channel 2 then channel 3)
 uint[2] read_2_surface_voxel_material_id(ivec3 v) {}
+// returns sdfs of voxel v, in ascending channel order.
+float[8][2] read_2_surface_voxel_sdfs(ivec3 v) {}
+
+// a voxel mapping, channel to material_id map plus the corresponding singed distance fields.
+void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) {}
 
 void write_first_surface(flaot[8] sdf, int material_id) {}
 void write_second_surface(flaot[8] sdf, int material_id) {}
 
 const MAX_RADIUS = 4 ; // in voxels // TODO find better name
 
-void write_thrird_surface(ivec3 voxel, flaot[8] sdf, int material_id) {
+// inner loop for the main write_thrird_surface function, i needed to break from the nested 3 loops
+void write_thrird_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3] v_prime_mapping_sdf, uint[2] v_materials // material ids sorted in ascending order
+) {
+    for (int k = -1; k <= 1; ++k)
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i)
+            {
+                ivec3 offset = ivec3(i, j, k);
+
+                if (offset == ivec3(0))
+                    continue;
+
+                uint neighbour_texel = texelFetch(tile_voxel_material, v + offset, 0).r;
+
+                if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
+                    continue;
+                }
+                if ((neighbour_texel & HEADER_MASK) == TWO_SURFACE_VOXEL_1_HEADER || (neighbour_texel & HEADER_MASK) == TWO_SURFACE_VOXEL_2_HEADER) {
+                    uint[2] neighbour_materials = read_2_surface_voxel_material_id(v + offset);
+                    sort2(neighbour_materials);
+
+                    if (neighbour_materials[0] == v_materials[0] && neighbour_materials[1] == v_materials[1]) {
+                        // this neighbour is encoding the same two surfaces either with the same mapping as us (one of the L*) or the compatible prime
+                        // mapping.
+                        continue;
+                    }
+
+                    write_two_surface_mapping(v + offset, v_prime_mapping, v_prime_mapping_sdf);
+                    return;
+                }
+                if ((neighbour_texel & HEADER_MASK) == THREE_SURFACE_VOXEL_HEADER) {
+                    // TODO maybe check that its our 3 surfaces and assert otherwise
+                    write_two_surface_mapping(v + offset, v_prime_mapping, v_prime_mapping_sdf);
+                    return;
+                }
+
+                // unreachable
+            }
+}
+
+void write_thrird_surface(ivec3 target_3_surface_voxel, flaot[8] sdf, int material_id) {
+    uint[3] ordered_materials;
+    uint[3] ordered_sdfs;
+    {
+        uint8[2] step_2_materials = read_2_surface_voxel_material_id(target_3_surface_voxel);
+        uint[3] ordered_materials = {
+                material_id,
+                step_2_materials[0],
+                step_2_materials[1]
+            };
+
+        float[8][2] step_2_sdfs = read_2_surface_voxel_sdfs(target_3_surface_voxel);
+        uint[3] ordered_sdfs = {
+                sdf,
+                step_2_sdfs[0],
+                step_2_sdfs[1]
+            };
+        sort_asc_material_id(ordered_materials, ordered_sdfs);
+    }
+
+    imageStore(tile_voxel_material, target_3_surface_voxel, uvec4(THREE_SURFACE_VOXEL_HEADER, 0u, 0u, 0u));
+
     for (int r = 0; r <= MAX_RADIUS; r++)
     {
         for (int z = -r; z <= r; z++)
@@ -175,7 +282,7 @@ void write_thrird_surface(ivec3 voxel, flaot[8] sdf, int material_id) {
                     if (max(max(abs(x), abs(y)), abs(z)) != r)
                         continue;
 
-                    ivec3 v = voxel + ivec3(x, y, z);
+                    ivec3 v = target_3_surface_voxel + ivec3(x, y, z);
 
                     // TODO: bounds check, i think we might not need code here because we are not at texture boundry, but we need to confirm this
                     uint texel = texelFetch(tile_voxel_material, v, 0).r;
@@ -192,6 +299,45 @@ void write_thrird_surface(ivec3 voxel, flaot[8] sdf, int material_id) {
                     }
 
                     // v is a TWO_SURFACE_VOXEL_C12_CONFIG
+                    uint[2] v_materials = read_2_surface_voxel_material_id(v);
+                    // assert(v_materials == sort2(v_materials)); // because this is a TWO_SURFACE_VOXEL_C12_CONFIG written by STEP_2_SURFACE, so it is ordered in ascending material_id.
+
+                    uint[3] v_prime_mapping;
+                    float[8][3] v_prime_mapping_sdf;
+                    if (v_materials[0] == ordered_materials[0] && v_materials[1] == ordered_materials[1]) {
+                        // L12
+                        v_prime_mapping[0] = ordered_materials[0];
+                        v_prime_mapping_sdf[0] = ordered_sdfs[0];
+
+                        v_prime_mapping[1] = UINT_MAX;
+
+                        v_prime_mapping[2] = ordered_materials[1];
+                        v_prime_mapping_sdf[2] = ordered_sdfs[1];
+                    } else if (v_materials[0] == ordered_materials[1] && v_materials[1] == ordered_materials[2]) {
+                        // L23
+                        v_prime_mapping[0] = UINT_MAX;
+
+                        v_prime_mapping[1] = ordered_materials[2];
+                        v_prime_mapping_sdf[1] = ordered_sdfs[2];
+
+                        v_prime_mapping[2] = ordered_materials[1];
+                        v_prime_mapping_sdf[2] = ordered_sdfs[1];
+                    }
+                    else if (v_materials[0] == ordered_materials[0] && v_materials[1] == ordered_materials[2]) {
+                        // L13
+                        v_prime_mapping[0] = ordered_materials[0];
+                        v_prime_mapping_sdf[0] = ordered_sdfs[0];
+
+                        v_prime_mapping[1] = ordered_materials[2];
+                        v_prime_mapping_sdf[1] = ordered_sdfs[2];
+
+                        v_prime_mapping[2] = UINT_MAX;
+                    } else {
+                        // this should not happen normally, only if geometry assemutions are not correct, most likely we have two three surface voxels close to each other.
+                        // TODO report error.
+                    }
+
+                    write_thrird_surface_inner_loop(v, v_prime_mapping, v_prime_mapping_sdf);
                 }
     }
 }

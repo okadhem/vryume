@@ -202,8 +202,46 @@ uint[2] read_2_surface_voxel_material_id(ivec3 v) {}
 // returns sdfs of voxel v, in ascending channel order.
 float[8][2] read_2_surface_voxel_sdfs(ivec3 v) {}
 
+uint read_1_surface_material(ivec3 v) {
+    //TODO
+}
+// converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
+uint coord_to_neighbour_id(uvec3 c) {
+    // coordinates relative to the lower corner "neighbour" in the 3x3 block.
+    uint x_corner = c.x + 1;
+    uint y_corner = c.y + 1;
+    uint z_corner = c.z + 1;
+    return x_corner + 3 * y_corner + 9 * z_corner;
+}
+// converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
+uvec3 neighbour_id_to_coord(uint neighbour_id) {
+    uint x_corner = neighbour_id % 3;
+    uint y_corner = (neighbour_id / 3) % 3;
+    uint z_corner = neighbour_id / 9;
+    return uvec3(x_corner,y_corner,z_corner) + uvec3(-1,-1,-1);
+}
+
+
 // a voxel mapping, channel to material_id map plus the corresponding singed distance fields.
-void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) {}
+void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) {
+    if(voxel_mapping[0] == UINT_MAX) {
+        // C23
+        uint neighbour_id = 0;
+        // the order of visit of neighbouring voxels is important.
+         for (int k = -1; k <= 1; ++k)
+         for (int j = -1; j <= 1; ++j)
+         for (int i = -1; i <= 1; ++i) {
+                ivec3 offset = ivec3(i, j, k);
+
+                if (offset == ivec3(0))
+                    continue;
+                read_1_surface_material(v + offset)
+                
+         }
+        
+    }
+
+}
 
 void write_first_surface(flaot[8] sdf, int material_id) {}
 void write_second_surface(flaot[8] sdf, int material_id) {}

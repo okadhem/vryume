@@ -226,8 +226,6 @@ uvec3 neighbour_id_to_coord(uint neighbour_id) {
 void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) {
     if(voxel_mapping[0] == UINT_MAX) {
         // C23
-        uint neighbour_id = 0;
-        // the order of visit of neighbouring voxels is important.
          for (int k = -1; k <= 1; ++k)
          for (int j = -1; j <= 1; ++j)
          for (int i = -1; i <= 1; ++i) {
@@ -235,9 +233,20 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) 
 
                 if (offset == ivec3(0))
                     continue;
-                read_1_surface_material(v + offset)
+                
+                uint neighbour_texel = texelFetch(tile_voxel_material, v + offset, 0).r;
+                if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
+                    uint neighbour_material_id = neighbour_texel & ~HEADER_MASK
+                    if(neighbour_material_id == voxel_mapping[1]) {
+                        uint neighbour_id = coord_to_neighbour_id(offset);
+                        imageStore(tile_voxel_material, v, uvec4(TWO_SURFACE_VOXEL_C23_CONFIG | neighbour_id, 0u, 0u, 0u));
+                        return;
+                    }
+                }
+                
                 
          }
+        //TODO: if we reach here, report an error
         
     }
 

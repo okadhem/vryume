@@ -135,7 +135,7 @@ const uint THREE_SURFACE_VOXEL_HEADER = 0b11000000u;
 // TODO: we need to find a way to assert if we write a sample with different surfaces distance values.
 
 // sort in assending material order, both the material_id array and the sdfs array.
-material_idoid sort_asc_material_id(inout int material_id[3], inout float[8][3] sdfs)
+void sort_asc_material_id(inout uint material_id[3], inout float[8][3] sdfs)
 {
     if (material_id[0] > material_id[1]) {
         int t = material_id[0];
@@ -287,42 +287,30 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) 
         //TODO report error
     }
 }
-//TODO; for all write_*_surface, handle the case when we are writting an already existéant surface.
 
-void write_first_surface(ivec3 voxel_id, int material_id) {}
+void write_first_surface(ivec3 voxel_id, uint[3] ordered_materials) {
+    uint data = ONE_SURFACE_VOXEL_HEADER | (ordered_materials & (~HEADER_MASK));
+    imageStore(tile_voxel_material, voxel_id, uvec4(data, 0u, 0u, 0u));
+}
 
-void write_second_surface(ivec3 voxel_id, flaot[8] second_surface_sdf, int second_surface_material_id) {
-    uint first_surface_material_id = read_1_surface_voxel_material_id(voxel_id);
-    float[8] first_surface_sdf = read_1_surface_voxel_sdf(voxel_id);
-
+void write_second_surface(ivec3 voxel_id, uint[3] ordered_materials, float[8][3] ordered_sdfs) {
     uint[3] voxel_mapping;
     float[8][3] voxel_sdf_mapping;
-    {
-        if (first_surface_material_id < second_surface_material_id) {
-            voxel_mapping[0] = first_surface_material_id;
-            voxel_sdf_mapping[0] = first_surface_sdf;
 
-            voxel_mapping[1] = second_surface_material_id;
-            voxel_sdf_mapping[1] = second_surface_sdf;
+    voxel_mapping[0] = ordered_materials[0];
+    voxel_sdf_mapping[0] = ordered_sdfs[0];
 
-            voxel_mapping[2] = UNMAPPED_CHANNEL;
-        } else {
-            voxel_mapping[0] = second_surface_material_id;
-            voxel_sdf_mapping[0] = second_surface_sdf
+    voxel_mapping[1] = ordered_materials[1];
+    voxel_sdf_mapping[1] = ordered_sdfs[1];
 
-            voxel_mapping[1] = first_surface_material_id;
-            voxel_sdf_mapping[1] = first_surface_sdf;
-
-            voxel_mapping[2] = UNMAPPED_CHANNEL;
-        }
-    }
+    voxel_mapping[2] = UNMAPPED_CHANNEL;
 
     write_two_surface_mapping(voxel_id, voxel_mapping, voxel_sdf_mapping);
 }
 
 const MAX_RADIUS = 4 ; // in voxels // TODO find better name
 
-// inner loop for the main write_third_surface function, i needed to break from the nested 3 loops
+// inner loop for the main write_third_surface function, i needed to be able to break from the nested 3 loops
 void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3] v_prime_mapping_sdf, uint[2] v_materials // material ids sorted in ascending order
 ) {
     for (int k = -1; k <= 1; ++k)
@@ -362,26 +350,9 @@ void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3
             }
 }
 
-void write_third_surface(ivec3 target_3_surface_voxel, flaot[8] sdf, int material_id) {
-    uint[3] ordered_materials;
-    uint[3] ordered_sdfs;
-    {
-        uint8[2] step_2_materials = read_2_surface_voxel_material_id(target_3_surface_voxel);
-        uint[3] ordered_materials = {
-                material_id,
-                step_2_materials[0],
-                step_2_materials[1]
-            };
-
-        float[8][2] step_2_sdfs = read_2_surface_voxel_sdfs(target_3_surface_voxel);
-        uint[3] ordered_sdfs = {
-                sdf,
-                step_2_sdfs[0],
-                step_2_sdfs[1]
-            };
-        sort_asc_material_id(ordered_materials, ordered_sdfs);
-    }
-
+// ordered_materials: materials ids in ascending material id order.
+// ordered_sdfs: sdfs in ascending material id order.
+void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials, float[8][3] ordered_sdfs) {
     imageStore(tile_voxel_material, target_3_surface_voxel, uvec4(THREE_SURFACE_VOXEL_HEADER, 0u, 0u, 0u));
 
     for (int r = 0; r <= MAX_RADIUS; r++)
@@ -455,10 +426,15 @@ void write_third_surface(ivec3 target_3_surface_voxel, flaot[8] sdf, int materia
 }
 
 void main() {
+    //TODO: we should handle multi primitive same material here, i am thinking just union the surfaces of material, but i am still not sure.
+
     ivec3 invocation_voxel_id = ivec3(gl_GlobalInvocationID.xyz);
     vec3 invocation_position = push_constant.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
 
-    int surfaces_written = 0;
+    uint primitive_hit = 0;
+
+    float[8][3] sdfs;
+    uint[3] material_ids;
 
     float[8] accumulated_removal;
     for (int i = 0; i < 8; i++) {
@@ -481,34 +457,39 @@ void main() {
         }
         if (!same_sign(primitive_minus_accumulated)) {
             // we hit a primitive, primitive_minus_accumulated is the sdf.
-            switch (step) {
-                case STEP_1_SURFACE:
-                write_first_surface(invocation_voxel_id, edit.material_id);
-                return;
-                break;
-
-                case STEP_2_SURFACE:
-                if (surfaces_written < 1) {
-                    // first surface is assumed written in previous step, we do nothing
-                    surfaces_written += 1;
-                } else {
-                    write_second_surface(invocation_voxel_id, primitive_minus_accumulated, edit.material_id);
-                    return;
-                }
-                break;
-
-                case STEP_3_SURFACE:
-                if (surfaces_written < 2) {
-                    // first surface and second surfaces are written in previous step, we do nothing
-                    surfaces_written += 1;
-                } else {
-                    write_third_surface(invocation_voxel_id, primitive_minus_accumulated, edit.material_id);
-                    return;
-                }
-            }
+            sdfs[primitive_hit] = primitive_minus_accumulated;
+            material_ids[primitive_hit] = edit.material_id;
+            primitive_hit += 1;
         }
         for (int i = 0; i < 8; i++) {
             accumulated_removal[i] = max(accumulated_removal[i], -primitive_voxel_sdf[i])
         }
+    }
+
+    sort_asc_material_id(material_ids, sdfs);
+
+    if (primitive_hit > 3) {
+        // should not happen under geometry assumptions
+        // TODO handle multi primitive same material
+        // TODO report error
+    }
+    switch (step) {
+        case STEP_1_SURFACE:
+        if (primitive_hit == 1) {
+            write_first_surface(invocation_voxel_id, material_ids, sdfs);
+        }
+        break;
+
+        case STEP_2_SURFACE:
+        if (primitive_hit == 2) {
+            write_second_surface(invocation_voxel_id, material_ids, sdfs);
+        }
+        break;
+
+        case STEP_3_SURFACE:
+        if (primitive_hit == 3) {
+            write_third_surface(invocation_voxel_id, material_ids, sdfs);
+        }
+        break;
     }
 }

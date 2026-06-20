@@ -168,10 +168,12 @@ material_idoid sort_asc_material_id(inout int material_id[3], inout float[8][3] 
 
 // we represent a voxel, channel to surface mapping with a 3 element uint array, where element 0 is
 // the surface mapped to the first channel, etc ..
-// if a channel is not mapped, we represent it with UINT_MAX.
+// if a channel is not mapped, we represent it with UNMAPPED_CHANNEL.
+const uint UNMAPPED_CHANNEL = UINT_MAX;
+
 bool are_mappings_compatible(uint[3] mapping1, uint[3] mapping2) {
     for (int i = 0; i < 3; i++) {
-        if (mapping1[i] == mapping2[i] || mapping1[i] == UINT_MAX || mapping2[i] == UINT_MAX) {
+        if (mapping1[i] == mapping2[i] || mapping1[i] == UNMAPPED_CHANNEL || mapping2[i] == UNMAPPED_CHANNEL) {
             continue;
         }
         return false;
@@ -202,7 +204,10 @@ uint[2] read_2_surface_voxel_material_id(ivec3 v) {}
 // returns sdfs of voxel v, in ascending channel order.
 float[8][2] read_2_surface_voxel_sdfs(ivec3 v) {}
 
-uint read_1_surface_material(ivec3 v) {
+uint read_1_surface_voxel_material_id(ivec3 v) {
+    //TODO
+}
+float[8] read_1_surface_voxel_sdf(ivec3 v) {
     //TODO
 }
 // converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
@@ -218,48 +223,107 @@ uvec3 neighbour_id_to_coord(uint neighbour_id) {
     uint x_corner = neighbour_id % 3;
     uint y_corner = (neighbour_id / 3) % 3;
     uint z_corner = neighbour_id / 9;
-    return uvec3(x_corner,y_corner,z_corner) + uvec3(-1,-1,-1);
+    return uvec3(x_corner, y_corner, z_corner) + uvec3(-1, -1, -1);
 }
-
 
 // a voxel mapping, channel to material_id map plus the corresponding singed distance fields.
 void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) {
-    if(voxel_mapping[0] == UINT_MAX) {
-        // C23
-         for (int k = -1; k <= 1; ++k)
-         for (int j = -1; j <= 1; ++j)
-         for (int i = -1; i <= 1; ++i) {
+    bool low_channel_surface_done = false;
+    bool high_channel_surface_done = false;
+
+    uint low_channel;
+    uint high_channel;
+    uint v_two_surface_config;
+    {
+        if (voxel_mapping[0] == UNMAPPED_CHANNEL) {
+            v_two_surface_config = TWO_SURFACE_VOXEL_C23_CONFIG;
+            low_channel = 1;
+            high_channel = 2;
+        } else if (voxel_mapping[1] == UNMAPPED_CHANNEL) {
+            v_two_surface_config = TWO_SURFACE_VOXEL_C13_CONFIG;
+            low_channel = 0;
+            high_channel = 2;
+        } else if (voxel_mapping[2] == UNMAPPED_CHANNEL) {
+            v_two_surface_config = TWO_SURFACE_VOXEL_C12_CONFIG
+            low_channel = 0;
+            high_channel = 1;
+        } else {
+            //TODO panic
+        }
+    }
+
+    for (int k = -1; k <= 1; ++k)
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i) {
                 ivec3 offset = ivec3(i, j, k);
 
                 if (offset == ivec3(0))
                     continue;
-                
+
                 uint neighbour_texel = texelFetch(tile_voxel_material, v + offset, 0).r;
+
                 if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
                     uint neighbour_material_id = neighbour_texel & ~HEADER_MASK
-                    if(neighbour_material_id == voxel_mapping[1]) {
+
+                    if (neighbour_material_id == voxel_mapping[low_channel] && !low_channel_surface_done) {
                         uint neighbour_id = coord_to_neighbour_id(offset);
-                        imageStore(tile_voxel_material, v, uvec4(TWO_SURFACE_VOXEL_C23_CONFIG | neighbour_id, 0u, 0u, 0u));
-                        return;
+                        imageStore(tile_voxel_material, v, uvec4(v_two_surface_config | neighbour_id, 0u, 0u, 0u));
+                        //TODO write the 2 sdf in the 3d texture, DO NOT WRITE THE UNUSED CHANNEL
+                        low_channel_surface_done = true;
+                    }
+
+                    if (neighbour_material_id == voxel_mapping[high_channel]) {
+                        high_channel_surface_done = true;
+                    }
+
+                    if (neighbour_material_id != voxel_mapping[low_channel] && neighbour_material_id != voxel_mapping[high_channel]) {
+                        // this should not happen v must be neighbouring only the two surfaces we are mapping, not any other.
+                        // TODO report an error
                     }
                 }
-                
-                
-         }
-        //TODO: if we reach here, report an error, or maybe we should not early return and complete the neighbours
-        // to make sure both neighbours are present and the encoding is correct
-        
+            }
+    if (!low_channel_surface_done || !high_channel_surface_done) {
+        // this should never happen, v must be neighbouring the two surfaces we are mapping
+        //TODO report error
+    }
+}
+//TODO; for all write_*_surface, handle the case when we are writting an already existéant surface.
+
+void write_first_surface(ivec3 voxel_id, int material_id) {}
+
+void write_second_surface(ivec3 voxel_id, flaot[8] second_surface_sdf, int second_surface_material_id) {
+    uint first_surface_material_id = read_1_surface_voxel_material_id(voxel_id);
+    float[8] first_surface_sdf = read_1_surface_voxel_sdf(voxel_id);
+
+    uint[3] voxel_mapping;
+    float[8][3] voxel_sdf_mapping;
+    {
+        if (first_surface_material_id < second_surface_material_id) {
+            voxel_mapping[0] = first_surface_material_id;
+            voxel_sdf_mapping[0] = first_surface_sdf;
+
+            voxel_mapping[1] = second_surface_material_id;
+            voxel_sdf_mapping[1] = second_surface_sdf;
+
+            voxel_mapping[2] = UNMAPPED_CHANNEL;
+        } else {
+            voxel_mapping[0] = second_surface_material_id;
+            voxel_sdf_mapping[0] = second_surface_sdf
+
+            voxel_mapping[1] = first_surface_material_id;
+            voxel_sdf_mapping[1] = first_surface_sdf;
+
+            voxel_mapping[2] = UNMAPPED_CHANNEL;
+        }
     }
 
+    write_two_surface_mapping(voxel_id, voxel_mapping, voxel_sdf_mapping);
 }
-
-void write_first_surface(flaot[8] sdf, int material_id) {}
-void write_second_surface(flaot[8] sdf, int material_id) {}
 
 const MAX_RADIUS = 4 ; // in voxels // TODO find better name
 
-// inner loop for the main write_thrird_surface function, i needed to break from the nested 3 loops
-void write_thrird_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3] v_prime_mapping_sdf, uint[2] v_materials // material ids sorted in ascending order
+// inner loop for the main write_third_surface function, i needed to break from the nested 3 loops
+void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3] v_prime_mapping_sdf, uint[2] v_materials // material ids sorted in ascending order
 ) {
     for (int k = -1; k <= 1; ++k)
         for (int j = -1; j <= 1; ++j)
@@ -298,7 +362,7 @@ void write_thrird_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][
             }
 }
 
-void write_thrird_surface(ivec3 target_3_surface_voxel, flaot[8] sdf, int material_id) {
+void write_third_surface(ivec3 target_3_surface_voxel, flaot[8] sdf, int material_id) {
     uint[3] ordered_materials;
     uint[3] ordered_sdfs;
     {
@@ -357,13 +421,13 @@ void write_thrird_surface(ivec3 target_3_surface_voxel, flaot[8] sdf, int materi
                         v_prime_mapping[0] = ordered_materials[0];
                         v_prime_mapping_sdf[0] = ordered_sdfs[0];
 
-                        v_prime_mapping[1] = UINT_MAX;
+                        v_prime_mapping[1] = UNMAPPED_CHANNEL;
 
                         v_prime_mapping[2] = ordered_materials[1];
                         v_prime_mapping_sdf[2] = ordered_sdfs[1];
                     } else if (v_materials[0] == ordered_materials[1] && v_materials[1] == ordered_materials[2]) {
                         // L23
-                        v_prime_mapping[0] = UINT_MAX;
+                        v_prime_mapping[0] = UNMAPPED_CHANNEL;
 
                         v_prime_mapping[1] = ordered_materials[2];
                         v_prime_mapping_sdf[1] = ordered_sdfs[2];
@@ -379,20 +443,20 @@ void write_thrird_surface(ivec3 target_3_surface_voxel, flaot[8] sdf, int materi
                         v_prime_mapping[1] = ordered_materials[2];
                         v_prime_mapping_sdf[1] = ordered_sdfs[2];
 
-                        v_prime_mapping[2] = UINT_MAX;
+                        v_prime_mapping[2] = UNMAPPED_CHANNEL;
                     } else {
                         // this should not happen normally, only if geometry assemutions are not correct, most likely we have two three surface voxels close to each other.
                         // TODO report error.
                     }
 
-                    write_thrird_surface_inner_loop(v, v_prime_mapping, v_prime_mapping_sdf);
+                    write_third_surface_inner_loop(v, v_prime_mapping, v_prime_mapping_sdf);
                 }
     }
 }
 
 void main() {
-    ivec3 invocation_id = ivec3(gl_GlobalInvocationID.xyz);
-    vec3 invocation_position = push_constant.tile_pos + invocation_id * inter_sample_distance; // in model space
+    ivec3 invocation_voxel_id = ivec3(gl_GlobalInvocationID.xyz);
+    vec3 invocation_position = push_constant.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
 
     int surfaces_written = 0;
 
@@ -419,7 +483,7 @@ void main() {
             // we hit a primitive, primitive_minus_accumulated is the sdf.
             switch (step) {
                 case STEP_1_SURFACE:
-                write_first_surface(primitive_minus_accumulated, edit.material_id);
+                write_first_surface(invocation_voxel_id, edit.material_id);
                 return;
                 break;
 
@@ -428,7 +492,7 @@ void main() {
                     // first surface is assumed written in previous step, we do nothing
                     surfaces_written += 1;
                 } else {
-                    write_second_surface(primitive_minus_accumulated, edit.material_id);
+                    write_second_surface(invocation_voxel_id, primitive_minus_accumulated, edit.material_id);
                     return;
                 }
                 break;
@@ -438,7 +502,7 @@ void main() {
                     // first surface and second surfaces are written in previous step, we do nothing
                     surfaces_written += 1;
                 } else {
-                    write_thrid_surface(primitive_minus_accumulated, edit.material_id);
+                    write_third_surface(invocation_voxel_id, primitive_minus_accumulated, edit.material_id);
                     return;
                 }
             }

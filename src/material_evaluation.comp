@@ -13,9 +13,14 @@ struct Edit {
     vec4 rotation; // unit quaternion
     vec3 translation;
 }
-const int STEP_1_SURFACE = 0;
-const int STEP_2_SURFACE = 1;
-const int STEP_3_SURFACE = 2;
+const int STEP_1_SURFACE = 0; // when this step is done, all one surface voxels are properly encoded.
+
+const int STEP_2_SURFACE = 1; // when this step is done, *most* of two surface voxels are properly encoded, precisely, all two surface voxels that
+// are away from a three voxel surface, (the line portion away from any intersection). other two surface voxel are encoded with *wrong* data
+// namely wrong configuration, and invalid sdf values, it is the job of STEP_3_SURFACE to fix that.
+
+const int STEP_3_SURFACE = 2; // when this step is done, all three surface voxels are encoded properly, as well as all the two surface voxels close
+// to three surface voxels, left in a wrong state by preious step.
 
 uniform Edit edit_list[4];
 uniform int edit_list_size;
@@ -354,6 +359,7 @@ void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3
 // ordered_sdfs: sdfs in ascending material id order.
 void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials, float[8][3] ordered_sdfs) {
     imageStore(tile_voxel_material, target_3_surface_voxel, uvec4(THREE_SURFACE_VOXEL_HEADER, 0u, 0u, 0u));
+    //TODO: write the sdfs of the 3 surface voxel
 
     for (int r = 0; r <= MAX_RADIUS; r++)
     {

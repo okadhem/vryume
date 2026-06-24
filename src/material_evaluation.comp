@@ -1,6 +1,12 @@
 #version 450
 // this shader runs per voxel, we identify a voxel with its low x,y,z corner.
 
+// [NOTE: Wrong sdfs after STEP_2_SURFACE]
+// At the end of STEP_2_SURFACE, the voxels close to the 3 surface voxels have wrong tile_voxel_material values, but also garbage sdf values
+// because of the concurrent incompatible writes to sample points, precisely, any two neigbouring voxels that belong to different lines (not same material_id pair)
+// will have garbage sdf values, therefore, STEP_3_SURFACE must not rely on this sdf values and must override them with the correct ones.
+// said another way, neighbouring voxels that don't have equal mappings will have wrong sdf values.
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
 struct Edit {
@@ -132,6 +138,10 @@ const uint THREE_SURFACE_VOXEL_HEADER = 0b11000000u;
 // so L12 with L12' is fine but L12 with L13' or L23' is not. technically speaking not all such
 // combinations are uncompatible, however for the same reason as above, we refrain from relying on that
 // because it would make the algorithm decision depend on an arbitrary material_id assignment.
+// a consequence of this is that we will automatically handle the issue expressed in [NOTE: Wrong sdfs after STEP_2_SURFACE]:
+// since after STEP_3_SURFACE, we will only allow strict compatibility between neighbouring 2 surface voxels, we are sure that any voxel pair
+// is either made of equal mappings, or prime version of one another, which originated from equal mappings in STEP_2_SURFACE
+// thus these mappings have correct sdf values.
 
 // The general idea of the algorithm is simply, look at the neighbouring (2surface) voxels to P, up to max radius.
 // if the voxel v has incompatible neighbours, meaning it is close to either P, other L* voxels
@@ -194,6 +204,15 @@ bool are_mappings_equal(uint[3] mapping1, uint[3] mapping2) {
     }
     return true;
 }
+
+// we will call cannocial voxel mappings the kind of mappings found at the end of STEP_2_SURFACE (L*) and STEP_3_SURFACE L* and L'*
+// so mapping in C12 with ordered material ids and their corresponding prime forms.
+// given 2 such voxels, we define the strict compatibility realtion as following
+// two voxels mappings are strictly compatible if they are equal.
+// two voxels mappings are strictly compatible if one is a STEP_2_SURFACE 2 voxel mapping and the other its prime form.
+// strict compatibility implies compatibility.
+// in order to test that two cannocial 2 surface voxel are strictly compatible, we can simply check that they map to the same
+// surfaces.
 
 // sort in assending order.
 void sort2(uint[2] a) {
@@ -337,8 +356,8 @@ void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3
                     sort2(neighbour_materials);
 
                     if (neighbour_materials[0] == v_materials[0] && neighbour_materials[1] == v_materials[1]) {
-                        // this neighbour is encoding the same two surfaces either with the same mapping as us (one of the L*) or the compatible prime
-                        // mapping.
+                        // both us and this neighbour are cannocial voxels, with same material ids, therefore we are
+                        // strictly compatible.
                         continue;
                     }
 

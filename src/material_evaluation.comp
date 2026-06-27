@@ -34,7 +34,9 @@ uniform int edit_list_size;
 layout(push_constant) uniform PushConstant {
     vec3 tile_pos; // in model space
     int step; // one of STEP_XXX, how many sub surface we should encode in this shader run. each step assumes the steps before are done.
-} push_constant;
+    uint voxel_texture_width; // in number of voxels
+    uint voxel_texture_height; // in number of voxels
+} pc;
 
 layout(
 set = 0,
@@ -48,8 +50,50 @@ binding = 0,
 r8
 ) uniform readonly image3D tile_sdf_image;
 
+layout(
+set = 0,
+binding = 2
+) buffer SDFPackedData {
+    uint sdf_texels_packed[]; // packed texels with R4G4_UNORM_PACK8 format, R in higher 4 bits
+};
+
+void write_sdf_mapping(ivec3 v, float[8][3] sdf_mapping, uint[3] voxel_mapping) {
+    // sdf_texels_packed holds sample points, dimensions are voxels + 1.
+    uint width = voxel_texture_width + 1;
+    uint height = voxel_texture_height + 1;
+
+    // order of sdf cell corner has to agree with the order in evaluate_primitive_voxel
+    // it is the order that sdf_mapping[_] is in
+    uint[8] offsets = uint[](
+            0, // (0,0,0)
+            1, // (1,0,0)
+            width, // (0,1,0)
+            width + 1, // (1,1,0)
+            width * height, // (0,0,1)
+            width * height + 1, // (1,0,1)
+            width * height + width, // (0,1,1)
+            width * height + width + 1, // (1,1,1)
+        );
+    uint zero_offset_index = v.x + v.y * width + v.z * width * height;
+    uint[8] current_value;
+    for (int i = 0; i < 8; i++) {
+        //current_value[i] = sdf_texels_packed[zero_offset_index + offsets[i]];
+
+        // we use atomic writes that require the location to be 4 byte aligned
+        uint atomic_word_index = (zero_offset_index + offsets[i]) / 4;
+
+        uint offset_in_atomic_word = (zero_offset_index + offsets[i]) % 4;
+
+        if (voxel_mapping[0] != UNMAPPED_CHANNEL) {
+            // channel 0 stored in low bits
+            // encode sdf_mapping[0][i] to 4 bits
+        }
+    }
+}
+
 // evaluate the primitive geometry regardless of if it is a removal or addition.
-flaot evaluate_primitive(Edit edit, vec3 pos) {
+flaot evaluate_primitive(Editedit, vec3pos) {
+    //TODO
     return 0;
 }
 
@@ -224,16 +268,32 @@ void sort2(uint[2] a) {
 }
 
 // returns material ids of voxel v, in ascending channel order. (example, material_id of channel 2 then channel 3)
-uint[2] read_2_surface_voxel_material_id(ivec3 v) {}
-// returns sdfs of voxel v, in ascending channel order.
-float[8][2] read_2_surface_voxel_sdfs(ivec3 v) {}
+uint[2] read_2_surface_voxel_material_id(ivec3 v) {
+    uint texel = texelFetch(tile_voxel_material, v).r;
+    uint low_channel_neighbour_id = texel & ~HEADER_TWO_SURFACE_CONFIG_MASK;
+    ivec3 low_channel_voxel = neighbour_id_to_coord(low_channel_neighbour_id) + v;
+    uint low_neighbour_texel = texelFetch(tile_voxel_material, low_channel_voxel).r;
+    uint low_channel_material_id = low_neighbour_texel & ~HEADER_MASK;
 
-uint read_1_surface_voxel_material_id(ivec3 v) {
-    //TODO
+    for (int k = -1; k <= 1; ++k)
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i) {
+                ivec3 offset = ivec3(i, j, k);
+                if (offset == ivec3(0))
+                    continue;
+                uint neighbour_texel = texelFetch(tile_voxel_material, v + offset).r;
+
+                if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
+                    uint neighbour_material_id = neighbour_texel & ~HEADER_MASK
+                    if (neighbour_material_id != low_channel_material_id) {
+                        return uint[2](low_channel_material_id, neighbour_material_id);
+                    }
+                }
+            }
+    // this should not happen, we must find two material id in the neighbours.
+    // TODO report an error.
 }
-float[8] read_1_surface_voxel_sdf(ivec3 v) {
-    //TODO
-}
+
 // converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
 uint coord_to_neighbour_id(uvec3 c) {
     // coordinates relative to the lower corner "neighbour" in the 3x3 block.
@@ -454,7 +514,7 @@ void main() {
     //TODO: we should handle multi primitive same material here, i am thinking just union the surfaces of material, but i am still not sure.
 
     ivec3 invocation_voxel_id = ivec3(gl_GlobalInvocationID.xyz);
-    vec3 invocation_position = push_constant.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
+    vec3 invocation_position = pc.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
 
     uint primitive_hit = 0;
 

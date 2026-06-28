@@ -31,6 +31,22 @@ float decode_distance(float sampled_distance) {
         sampled_distance);
 }
 
+uint norm_float_to_4bit_uint(float v) {
+    return uint(round(v * 15.0));
+}
+
+const float max_representable_distance_4bits = sqrt(3) * inter_sample_distance;
+const float min_representable_distance_4bits = -max_representable_distance_4bits;
+
+float encode_distance_4bits(float distance) {
+    // not sure clamping is needed here, algorithm only encodes distances near the surfaces.
+    float clamped = clamp(distance, min_representable_distance_4bits, max_representable_distance_4bits);
+    return inverse_mix(min_representable_distance_4bits, max_representable_distance_4bits, clamped);
+}
+float decode_distance_4bits(float distance) {
+    return mix(min_representable_distance_4bits, max_representable_distance_4bits, distance);
+}
+
 const float MIN_FLOAT = -3.402823e38;
 
 const uint UINT_MAX = 0xFFFFFFFFu;

@@ -57,7 +57,7 @@ binding = 2
     uint sdf_texels_packed[]; // packed texels with R4G4_UNORM_PACK8 format, R in higher 4 bits
 };
 
-void write_sdf_mapping(ivec3 v, float[8][3] sdf_mapping, uint[3] voxel_mapping) {
+void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf_mapping) {
     // sdf_texels_packed holds sample points, dimensions are voxels + 1.
     uint width = voxel_texture_width + 1;
     uint height = voxel_texture_height + 1;
@@ -374,7 +374,7 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) 
                     if (neighbour_material_id == voxel_mapping[low_channel] && !low_channel_surface_done) {
                         uint neighbour_id = coord_to_neighbour_id(offset);
                         imageStore(tile_voxel_material, v, uvec4(v_two_surface_config | neighbour_id, 0u, 0u, 0u));
-                        //TODO write the 2 sdf in the 3d texture, DO NOT WRITE THE UNUSED CHANNEL
+                        write_sdf_mapping(v, voxel_mapping, sdf);
                         low_channel_surface_done = true;
                     }
 
@@ -460,7 +460,11 @@ void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3
 // ordered_sdfs: sdfs in ascending material id order.
 void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials, float[8][3] ordered_sdfs) {
     imageStore(tile_voxel_material, target_3_surface_voxel, uvec4(THREE_SURFACE_VOXEL_HEADER, 0u, 0u, 0u));
-    //TODO: write the sdfs of the 3 surface voxel
+    {
+        uint[3] voxel_mapping = uint[3](ordered_materials[0], ordered_materials[2], ordered_materials[1]);
+        float[8][3] voxel_sdfs = float[8][3](ordered_sdfs[0], ordered_sdfs[2], ordered_sdfs[1]);
+        write_sdf_mapping(target_3_surface_voxel, voxel_mapping, voxel_sdfs);
+    }
 
     for (int r = 0; r <= MAX_RADIUS; r++)
     {

@@ -37,6 +37,7 @@ uint norm_float_to_4bit_uint(float v) {
 
 const float max_representable_distance_4bits = sqrt(3) * inter_sample_distance;
 const float min_representable_distance_4bits = -max_representable_distance_4bits;
+const float encoded_distance_resolution_4bits = (max_representable_distance_4bits - min_representable_distance_4bits) / 15.0;
 
 float encode_distance_4bits(float distance) {
     // not sure clamping is needed here, algorithm only encodes distances near the surfaces.

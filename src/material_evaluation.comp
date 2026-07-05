@@ -9,16 +9,6 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
-struct Edit {
-    bool is_removal;
-    int material_id;
-    int primitive_type;
-    float param[4];
-
-    // transform in model space
-    vec4 rotation; // unit quaternion
-    vec3 translation;
-}
 const int STEP_1_SURFACE = 0; // when this step is done, all one surface voxels are properly encoded.
 
 const int STEP_2_SURFACE = 1; // when this step is done, *most* of two surface voxels are properly encoded, precisely, all two surface voxels that
@@ -28,8 +18,10 @@ const int STEP_2_SURFACE = 1; // when this step is done, *most* of two surface v
 const int STEP_3_SURFACE = 2; // when this step is done, all three surface voxels are encoded properly, as well as all the two surface voxels close
 // to three surface voxels, left in a wrong state by preious step.
 
-uniform Edit edit_list[4];
-uniform int edit_list_size;
+layout(set = 0, binding = 3, std140) uniform EditsUniformBuffer {
+    uint edit_list_size;
+    Edit edit_list[4];
+};
 
 layout(push_constant) uniform PushConstant {
     vec3 tile_pos; // in model space
@@ -114,12 +106,6 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf_mapping) 
             }
         }
     }
-}
-
-// evaluate the primitive geometry regardless of if it is a removal or addition.
-flaot evaluate_primitive(Editedit, vec3pos) {
-    //TODO
-    return 0;
 }
 
 // calculate the sdf values in a specific order

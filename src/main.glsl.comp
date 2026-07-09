@@ -2,6 +2,8 @@
 #define DEBUG_MEASURE_ERROR
 layout(local_size_x = 16, local_size_y = 16) in;
 
+#include "types.h.glsl"
+
 layout(
 set = 0,
 binding = 0,
@@ -22,7 +24,7 @@ binding = 0
 layout(
 set = 2, //TODO: what is with the sets ??
 binding = 1, //TODO double check
-r8
+r8ui
 ) uniform uimage3D tile_voxel_material;
 
 layout(set = 2, binding = 2) uniform sampler3D sdf_packed_image;
@@ -42,19 +44,8 @@ layout(std430, push_constant) uniform PushConstant {
 #include "common.h.glsl"
 #include "material_evaluation.h.glsl"
 
-//TODO double check
-// q normalized quaternion
-vec3 rotate_by_quat(vec4 q, vec3 v) {
-    vec3 t = 2.0 * cross(q.xyz, v);
-    return v + q.w * t + cross(q.xyz, t);
-}
-
-vec4 inverse_unit_quat(vec4 q) {
-    return vec4(-q.x, -q.y, -q.z, q.w);
-}
-
 //#### this section is copy pasta from the evaluation shader, best we can do now because we don't have an include
-
+//TODO this is no longer correct
 float sphere_at_origin(vec3 pos, float r) {
     return length(pos) - r;
 }
@@ -238,20 +229,18 @@ void main() {
     vec3 ray_tip = ray_origin_tile;
     vec3 ray_tip_norm = ray_tip / pc.tile_extent;
     bool out_of_tile = false;
-    {
-        float distance = 0.0;
-        do {
-            bool in_range = all(greaterThanEqual(ray_tip_norm, vec3(0.0))) && all(lessThanEqual(ray_tip_norm, vec3(1.0)));
-            if (!in_range) {
-                out_of_tile = true;
-                break;
-            }
-            distance = sdf_norm(ray_tip_norm);
+    float distance = 0.0;
+    do {
+        bool in_range = all(greaterThanEqual(ray_tip_norm, vec3(0.0))) && all(lessThanEqual(ray_tip_norm, vec3(1.0)));
+        if (!in_range) {
+            out_of_tile = true;
+            break;
+        }
+        distance = sdf_norm(ray_tip_norm);
 
-            ray_tip += ray_direction_tile * distance;
-            ray_tip_norm = ray_tip / pc.tile_extent;
-        } while (distance > zero_distance);
-    }
+        ray_tip += ray_direction_tile * distance;
+        ray_tip_norm = ray_tip / pc.tile_extent;
+    } while (distance > zero_distance);
 
     if (out_of_tile) {
         imageStore(color_image, pixel_coord, vec4(0.0, 0.0, 0.0, 1.0));
@@ -261,17 +250,18 @@ void main() {
 
     uint material_id;
     {
-        ivec3 voxel_id = uvec3(vec3(dispatch_dim - uvec3(1, 1, 1)) * ray_tip_norm);
-        uint material_info = texelFetch(tile_voxel_material, voxel_id, 0).r;
+        ivec3 voxel_id = ivec3(vec3(dispatch_dim - uvec3(1, 1, 1)) * ray_tip_norm);
+        uint material_info = imageLoad(tile_voxel_material, voxel_id).r;
         if ((material_info & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
-            material_id = material_info & ~HEADER_MASK
+            material_id = material_info & ~HEADER_MASK;
         }
         else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C12_CONFIG) {
-            float[2] sampled_distances = texture(sdf_packed_image, ray_tip_norm).gr;
-            sampled_distances[0] = decode_distance_4bits(sampled_distances[0]);
-            sampled_distances[1] = decode_distance_4bits(sampled_distances[1]);
+            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            float sampled_distances[2];
+            sampled_distances[0] = decode_distance_4bits(tex.g);
+            sampled_distances[1] = decode_distance_4bits(tex.r);
 
-            uint[2] material_ids = read_2_surface_voxel_material_id(voxel_id);
+            uint material_ids[2] = read_2_surface_voxel_material_id(voxel_id);
 
             // in this particular case, we can sort the two sampled distances and pick the smaller one
             // it may give better results than the comparing to zero_distance_4bits
@@ -282,10 +272,11 @@ void main() {
             }
         }
         else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C13_CONFIG) {
-            float[2] sampled_distances = texture(sdf_packed_image, ray_tip_norm).gr;
-            sampled_distances[0] = decode_distance_4bits(sampled_distances[0]);
+            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            float sampled_distances[2];
+            sampled_distances[0] = decode_distance_4bits(tex.g);
 
-            uint[2] material_ids = read_2_surface_voxel_material_id(voxel_id);
+            uint material_ids[2] = read_2_surface_voxel_material_id(voxel_id);
             if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
                 material_id = material_ids[0];
             } else {
@@ -293,10 +284,11 @@ void main() {
             }
         }
         else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG) {
-            float[2] sampled_distances = texture(sdf_packed_image, ray_tip_norm).gr;
-            sampled_distances[1] = decode_distance_4bits(sampled_distances[1]);
+            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            float sampled_distances[2];
+            sampled_distances[1] = decode_distance_4bits(tex.r);
 
-            uint[2] material_ids = read_2_surface_voxel_material_id(voxel_id);
+            uint material_ids[2] = read_2_surface_voxel_material_id(voxel_id);
             if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
                 material_id = material_ids[0];
             } else {
@@ -304,11 +296,12 @@ void main() {
             }
         }
         else if ((material_info & HEADER_MASK) == THREE_SURFACE_VOXEL_HEADER) {
-            float[2] sampled_distances = texture(sdf_packed_image, ray_tip_norm).gr;
-            sampled_distances[0] = decode_distance_4bits(sampled_distances[0]);
-            sampled_distances[1] = decode_distance_4bits(sampled_distances[1]);
+            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            float sampled_distances[2];
+            sampled_distances[0] = decode_distance_4bits(tex.g);
+            sampled_distances[1] = decode_distance_4bits(tex.r);
 
-            uint[3] material_ids = read_3_surface_voxel_material_id(voxel_id);
+            uint material_ids[3] = read_3_surface_voxel_material_id(voxel_id);
 
             if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
                 material_id = material_ids[0];

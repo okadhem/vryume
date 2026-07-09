@@ -101,7 +101,7 @@ float sample(float fx, float fy, float texels[4]) {
          texels[2] * (1 - fx) * fy + texels[3] * fx * fy;
 }
 
-int main() {
+int main_test() {
   vec2 cell = {0.0f, 0.0f};
   float h = 0.002f;
   vec2 linePoint1 = {0.0f, 0.0f};

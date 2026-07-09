@@ -14,18 +14,18 @@
 // i.e for configuration C12 the neighbour index of the surface mapped by channel 1.
 // THREE_SURFACE_VOXEL, nothing in payload
 
-const uint HEADER_MASK = 0b11000000u;
-const uint HEADER_TWO_SURFACE_CONFIG_MASK = 0b11100000u;
-const uint ONE_SURFACE_VOXEL_HEADER = 0b00000000u;
-const uint TWO_SURFACE_VOXEL_1_HEADER = 0b01000000u;
-const uint TWO_SURFACE_VOXEL_C12_CONFIG = 0b01000000u;
-const uint TWO_SURFACE_VOXEL_C13_CONFIG = 0b01100000u;
-const uint TWO_SURFACE_VOXEL_2_HEADER = 0b10000000u;
-const uint TWO_SURFACE_VOXEL_C23_CONFIG = 0b10000000u;
-const uint THREE_SURFACE_VOXEL_HEADER = 0b11000000u;
+const uint HEADER_MASK = 0xC0u; // 0b11000000u;
+const uint HEADER_TWO_SURFACE_CONFIG_MASK = 0xE0u; // 0b11100000u;
+const uint ONE_SURFACE_VOXEL_HEADER = 0u; // 0b00000000u;
+const uint TWO_SURFACE_VOXEL_1_HEADER = 0x40u; // 0b01000000u;
+const uint TWO_SURFACE_VOXEL_C12_CONFIG = 0x40u; // 0b01000000u;
+const uint TWO_SURFACE_VOXEL_C13_CONFIG = 0x60u; //0b01100000u;
+const uint TWO_SURFACE_VOXEL_2_HEADER = 0x80u; //0b10000000u;
+const uint TWO_SURFACE_VOXEL_C23_CONFIG = 0x80u; //0b10000000u;
+const uint THREE_SURFACE_VOXEL_HEADER = 0xC0u; //0b11000000u;
 
 // converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
-uint coord_to_neighbour_id(uvec3 c) {
+uint coord_to_neighbour_id(ivec3 c) {
     // coordinates relative to the lower corner "neighbour" in the 3x3 block.
     uint x_corner = c.x + 1;
     uint y_corner = c.y + 1;
@@ -33,20 +33,20 @@ uint coord_to_neighbour_id(uvec3 c) {
     return x_corner + 3 * y_corner + 9 * z_corner;
 }
 // converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
-uvec3 neighbour_id_to_coord(uint neighbour_id) {
+ivec3 neighbour_id_to_coord(uint neighbour_id) {
     uint x_corner = neighbour_id % 3;
     uint y_corner = (neighbour_id / 3) % 3;
     uint z_corner = neighbour_id / 9;
-    return uvec3(x_corner, y_corner, z_corner) + uvec3(-1, -1, -1);
+    return ivec3(x_corner, y_corner, z_corner) + ivec3(-1, -1, -1);
 }
 
 // returns material ids of voxel v, in ascending channel order. (example, material_id of channel 2 then channel 3)
 uint[2] read_2_surface_voxel_material_id(ivec3 v) {
     //TODO we should accept this texel as input
-    uint texel = texelFetch(tile_voxel_material, v).r;
+    uint texel = imageLoad(tile_voxel_material, v).r;
     uint low_channel_neighbour_id = texel & ~HEADER_TWO_SURFACE_CONFIG_MASK;
     ivec3 low_channel_voxel = neighbour_id_to_coord(low_channel_neighbour_id) + v;
-    uint low_neighbour_texel = texelFetch(tile_voxel_material, low_channel_voxel).r;
+    uint low_neighbour_texel = imageLoad(tile_voxel_material, low_channel_voxel).r;
     uint low_channel_material_id = low_neighbour_texel & ~HEADER_MASK;
 
     for (int k = -1; k <= 1; ++k)
@@ -55,10 +55,10 @@ uint[2] read_2_surface_voxel_material_id(ivec3 v) {
                 ivec3 offset = ivec3(i, j, k);
                 if (offset == ivec3(0))
                     continue;
-                uint neighbour_texel = texelFetch(tile_voxel_material, v + offset).r;
+                uint neighbour_texel = imageLoad(tile_voxel_material, v + offset).r;
 
                 if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
-                    uint neighbour_material_id = neighbour_texel & ~HEADER_MASK
+                    uint neighbour_material_id = neighbour_texel & ~HEADER_MASK;
                     if (neighbour_material_id != low_channel_material_id) {
                         return uint[2](low_channel_material_id, neighbour_material_id);
                     }
@@ -81,24 +81,24 @@ uint[3] read_3_surface_voxel_material_id(ivec3 v) {
                 ivec3 offset = ivec3(i, j, k);
                 if (offset == ivec3(0))
                     continue;
-                uint neighbour_texel = texelFetch(tile_voxel_material, v + offset).r;
+                uint neighbour_texel = imageLoad(tile_voxel_material, v + offset).r;
 
                 // we are a 3 surface voxels, all our 2 surface voxels neighbours agree with us on channel mapping.
 
                 if ((neighbour_texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C12_CONFIG) {
-                    float[2] materials = read_2_surface_voxel_material_id(v);
+                    uint[2] materials = read_2_surface_voxel_material_id(v);
                     result[0] = materials[0];
                     result[1] = materials[1];
                 }
 
                 if ((neighbour_texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C13_CONFIG) {
-                    float[2] materials = read_2_surface_voxel_material_id(v);
+                    uint[2] materials = read_2_surface_voxel_material_id(v);
                     result[0] = materials[0];
                     result[2] = materials[1];
                 }
 
                 if ((neighbour_texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG) {
-                    float[2] materials = read_2_surface_voxel_material_id(v);
+                    uint[2] materials = read_2_surface_voxel_material_id(v);
                     result[1] = materials[0];
                     result[2] = materials[1];
                 }

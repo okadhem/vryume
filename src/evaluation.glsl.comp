@@ -2,6 +2,8 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
+#include "types.h.glsl"
+
 layout(push_constant) uniform PushConstant {
     vec3 tile_pos; // in model space
 } push_constant;
@@ -32,6 +34,7 @@ float model_signed_distance(vec3 pos) {
             accumulated_distance = min(accumulated_distance, primtive_distance);
         }
     }
+    return accumulated_distance;
 }
 
 void main() {

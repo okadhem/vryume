@@ -9,6 +9,8 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
+#include "types.h.glsl"
+
 const int STEP_1_SURFACE = 0; // when this step is done, all one surface voxels are properly encoded.
 
 const int STEP_2_SURFACE = 1; // when this step is done, *most* of two surface voxels are properly encoded, precisely, all two surface voxels that
@@ -33,7 +35,7 @@ layout(push_constant) uniform PushConstant {
 layout(
 set = 0,
 binding = 1, //TODO double check
-r8
+r8ui
 ) uniform uimage3D tile_voxel_material;
 
 layout(
@@ -46,16 +48,41 @@ layout(
 set = 0,
 binding = 2
 ) buffer SDFPackedData {
-    uint sdf_texels_packed[]; // packed texels with R4G4_UNORM_PACK8 format, R in higher 4 bits
+    coherent uint sdf_texels_packed[]; // packed texels with R4G4_UNORM_PACK8 format, R in higher 4 bits
 };
 
 #include "common.h.glsl"
+
 #include "material_evaluation.h.glsl"
 
-void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf_mapping) {
+// we represent a voxel, channel to surface mapping with a 3 element uint array, where element 0 is
+// the surface mapped to the first channel, etc ..
+// if a channel is not mapped, we represent it with UNMAPPED_CHANNEL.
+const uint UNMAPPED_CHANNEL = UINT_MAX;
+
+bool are_mappings_compatible(uint[3] mapping1, uint[3] mapping2) {
+    for (int i = 0; i < 3; i++) {
+        if (mapping1[i] == mapping2[i] || mapping1[i] == UNMAPPED_CHANNEL || mapping2[i] == UNMAPPED_CHANNEL) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool are_mappings_equal(uint[3] mapping1, uint[3] mapping2) {
+    for (int i = 0; i < 3; i++) {
+        if (mapping1[i] != mapping2[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf_mapping) {
     // sdf_texels_packed holds sample points, dimensions are voxels + 1.
-    uint width = voxel_texture_width + 1;
-    uint height = voxel_texture_height + 1;
+    uint width = pc.voxel_texture_width + 1;
+    uint height = pc.voxel_texture_height + 1;
 
     // order of sdf cell corner has to agree with the order in evaluate_primitive_voxel
     // it is the order that sdf_mapping[_] is in
@@ -67,7 +94,7 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf_mapping) 
             width * height, // (0,0,1)
             width * height + 1, // (1,0,1)
             width * height + width, // (0,1,1)
-            width * height + width + 1, // (1,1,1)
+            width * height + width + 1 // (1,1,1)
         );
     uint zero_offset_index = v.x + v.y * width + v.z * width * height;
 
@@ -81,27 +108,26 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf_mapping) 
 
         // CAS loop
         for (; ; ) {
-            uint current_value = atomicLoad(sdf_texels_packed[sample_buffer_index]);
-
+            uint current_value = atomicAdd(sdf_texels_packed[sample_buffer_index], 0);
             uint new_value = current_value;
             if (voxel_mapping[0] != UNMAPPED_CHANNEL) {
                 // channel 0 stored in low bits, G channel
                 uint distance = norm_float_to_4bit_uint(encode_distance_4bits(sdf_mapping[0][i]));
                 uint shift = 8 * texel_offset_in_atomic_word;
-                uint mask = 0b1111 << shift;
-                new_value = (new_value & ~mask) | (distance << shift)
+                uint mask = 0xF << shift; // 0xF = 0b1111
+                new_value = (new_value & ~mask) | (distance << shift);
             }
             if (voxel_mapping[1] != UNMAPPED_CHANNEL) {
                 // channel 1 stored in high bits, R channel
                 uint distance = norm_float_to_4bit_uint(encode_distance_4bits(sdf_mapping[1][i]));
                 uint shift = 8 * texel_offset_in_atomic_word + 4;
-                uint mask = 0b1111 << shift;
-                new_value = (new_value & ~mask) | (distance << shift)
+                uint mask = 0xF << shift; // 0xF = 0b1111
+                new_value = (new_value & ~mask) | (distance << shift);
             }
             // channel 2 is not written to the buffer, it is implied to be the total object sdf.
 
             uint value_before_write = atomicCompSwap(sdf_texels_packed[sample_buffer_index], current_value, new_value);
-            if value_before_write == current_value {
+            if (value_before_write == current_value) {
                 break;
             }
         }
@@ -124,7 +150,7 @@ float[8] evaluate_primitive_voxel(Edit edit, vec3 voxel_corner) {
 }
 
 // zero is both negative and positive
-bool same_sign(flaot[8] fs) {
+bool same_sign(float fs[8]) {
     bool has_positive = false;
     bool has_negative = false;
 
@@ -136,7 +162,7 @@ bool same_sign(flaot[8] fs) {
             has_negative = true;
     }
 
-    return !(hasPositive && hasNegative);
+    return !(has_positive && has_negative);
 }
 
 // The invariant that must be respected when deciding what surface each channel encodes is that a voxel should always
@@ -190,19 +216,19 @@ bool same_sign(flaot[8] fs) {
 // TODO: we need to find a way to assert if we write a sample with different surfaces distance values.
 
 // sort in assending material order, both the material_id array and the sdfs array.
-void sort_asc_material_id(inout uint material_id[3], inout float[8][3] sdfs)
+void sort_asc_material_id(inout uint material_id[3], inout float sdfs[3][8])
 {
     if (material_id[0] > material_id[1]) {
-        int t = material_id[0];
+        uint t = material_id[0];
         material_id[0] = material_id[1];
         material_id[1] = t;
 
-        float[8] tmp_sdf = sdfs[0];
+        float tmp_sdf[8] = sdfs[0];
         sdfs[0] = sdfs[1];
         sdfs[1] = tmp_sdf;
     }
     if (material_id[1] > material_id[2]) {
-        int t = material_id[1];
+        uint t = material_id[1];
         material_id[1] = material_id[2];
         material_id[2] = t;
 
@@ -211,38 +237,14 @@ void sort_asc_material_id(inout uint material_id[3], inout float[8][3] sdfs)
         sdfs[2] = tmp_sdf;
     }
     if (material_id[0] > material_id[1]) {
-        int t = material_id[0];
+        uint t = material_id[0];
         material_id[0] = material_id[1];
         material_id[1] = t;
 
         float[8] tmp_sdf = sdfs[0];
         sdfs[0] = sdfs[1];
-        sdfs[1] = t;
+        sdfs[1] = tmp_sdf;
     }
-}
-
-// we represent a voxel, channel to surface mapping with a 3 element uint array, where element 0 is
-// the surface mapped to the first channel, etc ..
-// if a channel is not mapped, we represent it with UNMAPPED_CHANNEL.
-const uint UNMAPPED_CHANNEL = UINT_MAX;
-
-bool are_mappings_compatible(uint[3] mapping1, uint[3] mapping2) {
-    for (int i = 0; i < 3; i++) {
-        if (mapping1[i] == mapping2[i] || mapping1[i] == UNMAPPED_CHANNEL || mapping2[i] == UNMAPPED_CHANNEL) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-bool are_mappings_equal(uint[3] mapping1, uint[3] mapping2) {
-    for (int i = 0; i < 3; i++) {
-        if (mapping1[i] != mapping2[i]) {
-            return false;
-        }
-    }
-    return true;
 }
 
 // we will call cannocial voxel mappings the kind of mappings found at the end of STEP_2_SURFACE (L*) and STEP_3_SURFACE L* and L'*
@@ -257,14 +259,14 @@ bool are_mappings_equal(uint[3] mapping1, uint[3] mapping2) {
 // sort in assending order.
 void sort2(uint[2] a) {
     if (a[0] > a[1]) {
-        int t = a[0];
+        uint t = a[0];
         a[0] = a[1];
         a[1] = t;
     }
 }
 
 // a voxel mapping, channel to material_id map plus the corresponding singed distance fields.
-void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) {
+void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf) {
     bool low_channel_surface_done = false;
     bool high_channel_surface_done = false;
 
@@ -281,7 +283,7 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) 
             low_channel = 0;
             high_channel = 2;
         } else if (voxel_mapping[2] == UNMAPPED_CHANNEL) {
-            v_two_surface_config = TWO_SURFACE_VOXEL_C12_CONFIG
+            v_two_surface_config = TWO_SURFACE_VOXEL_C12_CONFIG;
             low_channel = 0;
             high_channel = 1;
         } else {
@@ -297,10 +299,10 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) 
                 if (offset == ivec3(0))
                     continue;
 
-                uint neighbour_texel = texelFetch(tile_voxel_material, v + offset, 0).r;
+                uint neighbour_texel = imageLoad(tile_voxel_material, v + offset).r;
 
                 if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
-                    uint neighbour_material_id = neighbour_texel & ~HEADER_MASK
+                    uint neighbour_material_id = neighbour_texel & ~HEADER_MASK;
 
                     if (neighbour_material_id == voxel_mapping[low_channel] && !low_channel_surface_done) {
                         uint neighbour_id = coord_to_neighbour_id(offset);
@@ -326,13 +328,13 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[8][3] sdf) 
 }
 
 void write_first_surface(ivec3 voxel_id, uint[3] ordered_materials) {
-    uint data = ONE_SURFACE_VOXEL_HEADER | (ordered_materials & (~HEADER_MASK));
+    uint data = ONE_SURFACE_VOXEL_HEADER | (ordered_materials[0] & (~HEADER_MASK));
     imageStore(tile_voxel_material, voxel_id, uvec4(data, 0u, 0u, 0u));
 }
 
-void write_second_surface(ivec3 voxel_id, uint[3] ordered_materials, float[8][3] ordered_sdfs) {
+void write_second_surface(ivec3 voxel_id, uint[3] ordered_materials, float[3][8] ordered_sdfs) {
     uint[3] voxel_mapping;
-    float[8][3] voxel_sdf_mapping;
+    float[3][8] voxel_sdf_mapping;
 
     voxel_mapping[0] = ordered_materials[0];
     voxel_sdf_mapping[0] = ordered_sdfs[0];
@@ -345,10 +347,10 @@ void write_second_surface(ivec3 voxel_id, uint[3] ordered_materials, float[8][3]
     write_two_surface_mapping(voxel_id, voxel_mapping, voxel_sdf_mapping);
 }
 
-const MAX_RADIUS = 4 ; // in voxels // TODO find better name
+const int MAX_RADIUS = 4; // in voxels // TODO find better name
 
 // inner loop for the main write_third_surface function, i needed to be able to break from the nested 3 loops
-void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3] v_prime_mapping_sdf, uint[2] v_materials // material ids sorted in ascending order
+void write_third_surface_inner_loop(ivec3 v, uint v_prime_mapping[3], float v_prime_mapping_sdf[3][8], uint v_materials[2] // material ids sorted in ascending order
 ) {
     for (int k = -1; k <= 1; ++k)
         for (int j = -1; j <= 1; ++j)
@@ -359,7 +361,7 @@ void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3
                 if (offset == ivec3(0))
                     continue;
 
-                uint neighbour_texel = texelFetch(tile_voxel_material, v + offset, 0).r;
+                uint neighbour_texel = imageLoad(tile_voxel_material, v + offset).r;
 
                 if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
                     continue;
@@ -389,11 +391,11 @@ void write_third_surface_inner_loop(ivec3 v, uint[3] v_prime_mapping, float[8][3
 
 // ordered_materials: materials ids in ascending material id order.
 // ordered_sdfs: sdfs in ascending material id order.
-void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials, float[8][3] ordered_sdfs) {
+void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials, float[3][8] ordered_sdfs) {
     imageStore(tile_voxel_material, target_3_surface_voxel, uvec4(THREE_SURFACE_VOXEL_HEADER, 0u, 0u, 0u));
     {
         uint[3] voxel_mapping = uint[3](ordered_materials[0], ordered_materials[2], ordered_materials[1]);
-        float[8][3] voxel_sdfs = float[8][3](ordered_sdfs[0], ordered_sdfs[2], ordered_sdfs[1]);
+        float[3][8] voxel_sdfs = float[3][8](ordered_sdfs[0], ordered_sdfs[2], ordered_sdfs[1]);
         write_sdf_mapping(target_3_surface_voxel, voxel_mapping, voxel_sdfs);
     }
 
@@ -410,7 +412,7 @@ void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials
                     ivec3 v = target_3_surface_voxel + ivec3(x, y, z);
 
                     // TODO: bounds check, i think we might not need code here because we are not at texture boundry, but we need to confirm this
-                    uint texel = texelFetch(tile_voxel_material, v, 0).r;
+                    uint texel = imageLoad(tile_voxel_material, v).r;
                     if ((texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C13_CONFIG
                             || (texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG
                             || (texel & HEADER_MASK) == THREE_SURFACE_VOXEL_HEADER) {
@@ -428,7 +430,7 @@ void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials
                     // assert(v_materials == sort2(v_materials)); // because this is a TWO_SURFACE_VOXEL_C12_CONFIG written by STEP_2_SURFACE, so it is ordered in ascending material_id.
 
                     uint[3] v_prime_mapping;
-                    float[8][3] v_prime_mapping_sdf;
+                    float[3][8] v_prime_mapping_sdf;
                     if (v_materials[0] == ordered_materials[0] && v_materials[1] == ordered_materials[1]) {
                         // L12
                         v_prime_mapping[0] = ordered_materials[0];
@@ -462,7 +464,7 @@ void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials
                         // TODO report error.
                     }
 
-                    write_third_surface_inner_loop(v, v_prime_mapping, v_prime_mapping_sdf);
+                    write_third_surface_inner_loop(v, v_prime_mapping, v_prime_mapping_sdf, v_materials);
                 }
     }
 }
@@ -476,7 +478,7 @@ void main() {
 
     uint primitive_hit = 0;
 
-    float[8][3] sdfs;
+    float[3][8] sdfs;
     uint[3] material_ids;
 
     float[8] accumulated_removal;
@@ -484,19 +486,19 @@ void main() {
         accumulated_removal[i] = MIN_FLOAT;
     }
 
-    for (int edit_id = edit_list_size - 1; edit_id >= 0; edit_id--) {
+    for (int edit_id = int(edit_list_size - 1); edit_id >= 0; edit_id--) {
         Edit edit = edit_list[edit_id];
         float[8] primitive_voxel_sdf = evaluate_primitive_voxel(edit, invocation_position);
         if (edit.is_removal) {
             for (int i = 0; i < 8; i++) {
-                accumulated_removal[i] = max(accumulated_removal[i], -primitive_voxel_sdf[i])
+                accumulated_removal[i] = max(accumulated_removal[i], -primitive_voxel_sdf[i]);
             }
             continue;
         }
 
         float[8] primitive_minus_accumulated;
         for (int i = 0; i < 8; i++) {
-            primitive_minus_accumulated[i] = max(accumulated_removal[i], primitive_voxel_sdf[i])
+            primitive_minus_accumulated[i] = max(accumulated_removal[i], primitive_voxel_sdf[i]);
         }
         if (!same_sign(primitive_minus_accumulated)) {
             // we hit a primitive, primitive_minus_accumulated is the sdf.
@@ -505,7 +507,7 @@ void main() {
             primitive_hit += 1;
         }
         for (int i = 0; i < 8; i++) {
-            accumulated_removal[i] = max(accumulated_removal[i], -primitive_voxel_sdf[i])
+            accumulated_removal[i] = max(accumulated_removal[i], -primitive_voxel_sdf[i]);
         }
     }
 
@@ -516,10 +518,10 @@ void main() {
         // TODO handle multi primitive same material
         // TODO report error
     }
-    switch (step) {
+    switch (pc.step) {
         case STEP_1_SURFACE:
         if (primitive_hit == 1) {
-            write_first_surface(invocation_voxel_id, material_ids, sdfs);
+            write_first_surface(invocation_voxel_id, material_ids);
         }
         break;
 

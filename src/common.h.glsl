@@ -53,19 +53,6 @@ const float MAX_FLOAT = 3.402823466e+38;
 
 const uint UINT_MAX = 0xFFFFFFFFu;
 
-struct Edit {
-    bool is_removal;
-    int material_id;
-    uint primitive_type;
-    float param[4];
-
-    // transform in model space
-    vec4 rotation; // unit quaternion
-    vec3 translation;
-}
-const uint EDIT_PRIMITIVE_SPHERE = 1;
-const uint EDIT_PRIMITIVE_BOX = 2;
-
 //TODO double check
 // q normalized quaternion
 vec3 rotate_by_quat(vec4 q, vec3 v) {
@@ -88,7 +75,7 @@ float sd_box(vec3 p, vec3 b)
 
 // evaluate the primitive geometry regardless of if it is a removal or addition.
 // pos is in model space
-flaot evaluate_primitive(Edit edit, vec3 pos) {
+float evaluate_primitive(Edit edit, vec3 pos) {
     vec3 edit_local_pos = rotate_by_quat(inverse_unit_quat(edit.rotation), pos - edit.translation);
     switch (edit.primitive_type) {
         case EDIT_PRIMITIVE_SPHERE:
@@ -96,7 +83,7 @@ flaot evaluate_primitive(Edit edit, vec3 pos) {
         break;
 
         case EDIT_PRIMITIVE_BOX:
-        return sd_box(edit_local_pos, vec3(edit.param[0], edit.param[1], edit.param[2]) ;
+        return sd_box(edit_local_pos, vec3(edit.param[0], edit.param[1], edit.param[2]));
         break;
     }
     // TODO panic

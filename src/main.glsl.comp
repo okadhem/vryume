@@ -25,7 +25,7 @@ layout(
 set = 2, //TODO: what is with the sets ??
 binding = 1, //TODO double check
 r8ui
-) uniform uimage3D tile_voxel_material;
+) uniform readonly uimage3D tile_voxel_material;
 
 layout(set = 2, binding = 2) uniform sampler3D sdf_packed_image;
 

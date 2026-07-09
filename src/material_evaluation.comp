@@ -40,12 +40,6 @@ r8ui
 
 layout(
 set = 0,
-binding = 0,
-r8
-) uniform readonly image3D tile_sdf_image;
-
-layout(
-set = 0,
 binding = 2
 ) buffer SDFPackedData {
     coherent uint sdf_texels_packed[]; // packed texels with R4G4_UNORM_PACK8 format, R in higher 4 bits

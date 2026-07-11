@@ -120,11 +120,15 @@ static VkFormat depth_swapchain_format = VK_FORMAT_D32_SFLOAT;
 static PFN_vkCmdPipelineBarrier2KHR loaded_vkCmdPipelineBarrier2;
 static uint32_t device_only_memory_type_index;
 static VkMemoryPropertyFlags device_only_memory_type_property_flags;
+static uint32_t host_visible_memory_type_index;
+static VkMemoryPropertyFlags host_visible_memory_type_property_flags;
 static VkDescriptorPool rendering_descriptor_pool;
 static VkDescriptorSet rendering_descriptor_set;
-static VkSampler rendering_tile_sampler;
 static RENDERDOC_API_1_4_1 *renderdoc_api = nullptr;
 static bool capture_frame = false;
+
+static VkBuffer edit_list_buffer;
+static VkDeviceMemory edit_list_memory;
 
 // the transform is the rotation followed by the translation
 struct RigidTransform {
@@ -223,45 +227,174 @@ VkShaderModule load_shader_module(const char *file_name) {
 
   return result;
 }
+struct SimpleImageCreateInfo {
+  VkImageType imageType;
+  VkFormat format;
+  VkExtent3D extent;
+  VkImageUsageFlags usage;
+  uint32 memoryTypeIndex;
+  VkImageViewType imageViewType;
+};
+void create_simple_image(SimpleImageCreateInfo simple_info, VkImage *image,
+                         VkImageView *image_view, VkDeviceMemory *memory) {
+  VkImageCreateInfo image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = simple_info.imageType,
+      .format = simple_info.format,
+      .extent = simple_info.extent,
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = simple_info.usage,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+      //
+  };
 
+  CHECK_VK(vkCreateImage(vkDevice, &image_info, nullptr, image));
+  VkMemoryRequirements memory_requirements;
+  vkGetImageMemoryRequirements(vkDevice, *image, &memory_requirements);
+
+  assert(memory_requirements.memoryTypeBits &
+         (1u << simple_info.memoryTypeIndex));
+
+  VkMemoryAllocateInfo alloc_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = memory_requirements.size,
+      .memoryTypeIndex = simple_info.memoryTypeIndex};
+
+  CHECK_VK(vkAllocateMemory(vkDevice, &alloc_info, nullptr, memory));
+
+  vkBindImageMemory(vkDevice, *image, *memory, 0);
+
+  VkImageViewCreateInfo image_view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = *image,
+      .viewType = simple_info.imageViewType,
+      .format = simple_info.format,
+      .components =
+          VkComponentMapping{
+              .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+              .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+              .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+              .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+          },
+      .subresourceRange =
+          VkImageSubresourceRange{
+              .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          }
+
+  };
+  CHECK_VK(vkCreateImageView(vkDevice, &image_view_info, nullptr, image_view));
+}
+
+struct SimpleBufferCreateInfo {
+  VkDeviceSize size;
+  VkBufferUsageFlags usage;
+  uint32 memoryTypeIndex;
+};
+void create_simple_buffer(SimpleBufferCreateInfo simple_info, VkBuffer *buffer,
+                          VkDeviceMemory *memory) {
+  VkBufferCreateInfo create_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = simple_info.size,
+      .usage = simple_info.usage,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+
+  };
+  CHECK_VK(vkCreateBuffer(vkDevice, &create_info, nullptr, buffer));
+
+  VkMemoryRequirements memory_requirements;
+  vkGetBufferMemoryRequirements(vkDevice, *buffer, &memory_requirements);
+
+  assert(memory_requirements.memoryTypeBits &
+         (1u << simple_info.memoryTypeIndex));
+
+  VkMemoryAllocateInfo alloc_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = memory_requirements.size,
+      .memoryTypeIndex = simple_info.memoryTypeIndex,
+  };
+  CHECK_VK(vkAllocateMemory(vkDevice, &alloc_info, nullptr, memory));
+
+  vkBindBufferMemory(vkDevice, *buffer, *memory,
+                     0); // Offset
+}
+
+struct MaterialEvaluationPushConstant {
+  float tile_pos[3]; // vec3 alignment=16
+  float _pad; // pad to 16 so than next EvaluationPushConstant value in an array
+              // starts at the correct alignment
+};
 struct EvaluationPushConstant {
   float tile_pos[3]; // vec3 alignment=16
   float _pad; // pad to 16 so than next EvaluationPushConstant value in an array
               // starts at the correct alignment
 };
 struct EvaluationState {
-  VkPipelineLayout pipeline_layout;
-  VkPipeline pipeline;
-  VkImageView tile_image_view;
-  VkImage tile_image;
-  VkDescriptorSet descriptor_set;
-  VkDeviceMemory tile_image_memory;
-  VkDescriptorSetLayout descriptor_set_layout;
-  VkExtent3D tile_image_extent;
+  VkPipelineLayout sdf_pipeline_layout;
+  VkPipeline sdf_pipeline;
+  VkDescriptorSet sdf_descriptor_set;
+  VkDescriptorSetLayout sdf_descriptor_set_layout;
+
+  VkImageView sdf_tile_image_view;
+  VkImage sdf_tile_image;
+  VkDeviceMemory sdf_tile_image_memory;
+  VkExtent3D sdf_tile_image_extent;
+  VkSampler sdf_tile_image_sampler;
+
+  VkPipelineLayout materials_pipeline_layout;
+  VkPipeline materials_pipeline;
+  VkDescriptorSet materials_descriptor_set;
+  VkDescriptorSetLayout materials_descriptor_set_layout;
+
+  VkImageView material_info_image_view;
+  VkImage material_info_image;
+  VkDeviceMemory material_info_image_memory;
+
+  VkBuffer material_sdf_packed;
+  VkDeviceMemory material_sdf_packed_memory;
+
+  VkImageView material_sdf_image_view;
+  VkImage material_sdf_image;
+  VkDeviceMemory material_sdf_image_memory;
+  VkSampler material_sdf_image_sampler;
 };
 
 static EvaluationState evaluation_state;
 // returns barrier needed to initialize the image before first shader access
-VkImageMemoryBarrier2 initialize_evaluation_state() {
+void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
+  // sdf_pipeine and layout
   {
-    VkDescriptorSetLayoutBinding tile_image_binding = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        .pImmutableSamplers = NULL};
+    VkDescriptorSetLayoutBinding sdf_pipeline_bindings[] = {
+        {.binding = 0,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pImmutableSamplers = NULL},
+
+        {.binding = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pImmutableSamplers = NULL}};
 
     VkDescriptorSetLayoutCreateInfo evaluation_descriptor_set_layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings = &tile_image_binding};
+        .bindingCount = 2,
+        .pBindings = sdf_pipeline_bindings};
 
     CHECK_VK(vkCreateDescriptorSetLayout(
         vkDevice, &evaluation_descriptor_set_layout_info, nullptr,
-        &evaluation_state.descriptor_set_layout));
+        &evaluation_state.sdf_descriptor_set_layout));
 
     VkDescriptorSetLayout set_layouts[] = {
-        evaluation_state.descriptor_set_layout};
+        evaluation_state.sdf_descriptor_set_layout};
 
     VkPushConstantRange push_range = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -277,10 +410,7 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
         .pPushConstantRanges = &push_range};
 
     CHECK_VK(vkCreatePipelineLayout(vkDevice, &pipelineLayoutInfo, nullptr,
-                                    &evaluation_state.pipeline_layout));
-  }
-
-  {
+                                    &evaluation_state.sdf_pipeline_layout));
 
     VkShaderModule shader_module = load_shader_module("evaluation.glsl.spv");
 
@@ -293,105 +423,341 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
     VkComputePipelineCreateInfo pipeline_info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = stageInfo,
-        .layout = evaluation_state.pipeline_layout};
+        .layout = evaluation_state.sdf_pipeline_layout};
 
     CHECK_VK(vkCreateComputePipelines(vkDevice, VK_NULL_HANDLE, 1,
                                       &pipeline_info, NULL,
-                                      &evaluation_state.pipeline));
+                                      &evaluation_state.sdf_pipeline));
   }
+
+  // material_pipeline and layout
   {
-    evaluation_state.tile_image_extent = {
+    VkDescriptorSetLayoutBinding bindings[] = {
+        {.binding = 0,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pImmutableSamplers = NULL},
+        {.binding = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pImmutableSamplers = NULL},
+        {.binding = 2,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pImmutableSamplers = NULL},
+        {.binding = 3,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pImmutableSamplers = NULL}};
+
+    VkDescriptorSetLayoutCreateInfo descriptor_set_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 4,
+        .pBindings = bindings};
+
+    CHECK_VK(vkCreateDescriptorSetLayout(
+        vkDevice, &descriptor_set_layout_info, nullptr,
+        &evaluation_state.materials_descriptor_set_layout));
+
+    VkDescriptorSetLayout set_layouts[] = {
+        evaluation_state.materials_descriptor_set_layout};
+
+    VkPushConstantRange push_range = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(MaterialEvaluationPushConstant),
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = set_layouts,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_range};
+
+    CHECK_VK(
+        vkCreatePipelineLayout(vkDevice, &pipelineLayoutInfo, nullptr,
+                               &evaluation_state.materials_pipeline_layout));
+
+    VkShaderModule shader_module =
+        load_shader_module("material_evaluation.glsl.spv");
+
+    VkPipelineShaderStageCreateInfo stageInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shader_module,
+        .pName = "main"};
+
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = stageInfo,
+        .layout = evaluation_state.materials_pipeline_layout};
+
+    CHECK_VK(vkCreateComputePipelines(vkDevice, VK_NULL_HANDLE, 1,
+                                      &pipeline_info, NULL,
+                                      &evaluation_state.materials_pipeline));
+  }
+
+  {
+    evaluation_state.sdf_tile_image_extent = {
         .width = 1000, .height = 1000, .depth = 1000};
 
-    VkImageCreateInfo image_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_3D,
-        .format = VK_FORMAT_R8_UNORM,
-        // TODO image size must be divisible by shader group size, we need a way
-        // to make this less error prone
-        .extent = evaluation_state.tile_image_extent,
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    CHECK_VK(vkCreateImage(vkDevice, &image_info, nullptr,
-                           &evaluation_state.tile_image));
-    VkMemoryRequirements memory_requirements;
-    vkGetImageMemoryRequirements(vkDevice, evaluation_state.tile_image,
-                                 &memory_requirements);
-    assert(memory_requirements.memoryTypeBits &
-           (1u << device_only_memory_type_index));
-    VkMemoryAllocateInfo alloc_info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = memory_requirements.size,
-        .memoryTypeIndex = device_only_memory_type_index};
+    create_simple_image(
+        SimpleImageCreateInfo{
+            .imageType = VK_IMAGE_TYPE_3D,
+            .format = VK_FORMAT_R8_UNORM,
+            // TODO image size must be divisible by shader group size, we need a
+            // way to make this less error prone
+            .extent = evaluation_state.sdf_tile_image_extent,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+            .imageViewType = VK_IMAGE_VIEW_TYPE_3D,
+            .memoryTypeIndex = device_only_memory_type_index,
+        },
+        &evaluation_state.sdf_tile_image, &evaluation_state.sdf_tile_image_view,
+        &evaluation_state.material_info_image_memory);
 
-    CHECK_VK(vkAllocateMemory(vkDevice, &alloc_info, nullptr,
-                              &evaluation_state.tile_image_memory));
-
-    vkBindImageMemory(vkDevice, evaluation_state.tile_image,
-                      evaluation_state.tile_image_memory, 0);
-  }
-  {
-    VkImageViewCreateInfo image_view_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = evaluation_state.tile_image,
-        .viewType = VK_IMAGE_VIEW_TYPE_3D,
-        .format = VK_FORMAT_R8_UNORM,
-        .components =
-            VkComponentMapping{
-                .r = VK_COMPONENT_SWIZZLE_IDENTITY,
-                .g = VK_COMPONENT_SWIZZLE_IDENTITY,
-                .b = VK_COMPONENT_SWIZZLE_IDENTITY,
-                .a = VK_COMPONENT_SWIZZLE_IDENTITY,
-            },
-        .subresourceRange =
-            VkImageSubresourceRange{
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            }
-
+    VkExtent3D material_info_extent = {
+        .width = evaluation_state.sdf_tile_image_extent.width - 1,
+        .height = evaluation_state.sdf_tile_image_extent.height - 1,
+        .depth = evaluation_state.sdf_tile_image_extent.depth - 1,
     };
-    CHECK_VK(vkCreateImageView(vkDevice, &image_view_info, nullptr,
-                               &evaluation_state.tile_image_view));
+    create_simple_image(
+        SimpleImageCreateInfo{
+            .imageType = VK_IMAGE_TYPE_3D,
+            .format = VK_FORMAT_R8_UNORM,
+            // TODO image size must be divisible by shader group size, we
+            // need a way to make this less error prone
+            .extent = material_info_extent,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+            .imageViewType = VK_IMAGE_VIEW_TYPE_3D,
+            .memoryTypeIndex = device_only_memory_type_index,
+        },
+        &evaluation_state.material_info_image,
+        &evaluation_state.material_info_image_view,
+        &evaluation_state.material_info_image_memory);
+
+    create_simple_buffer(
+        SimpleBufferCreateInfo{
+            .size = evaluation_state.sdf_tile_image_extent.width *
+                    evaluation_state.sdf_tile_image_extent.height *
+                    evaluation_state.sdf_tile_image_extent.depth,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .memoryTypeIndex =
+                host_visible_memory_type_index, // only GPU will use this, yet
+                                                // we do this to get a page in
+                                                // RAM because of memory
+                                                // pressure
+        },
+        &evaluation_state.material_sdf_packed,
+        &evaluation_state.material_sdf_packed_memory);
+
+    create_simple_image(
+        SimpleImageCreateInfo{
+            .imageType = VK_IMAGE_TYPE_3D,
+            .format = VK_FORMAT_R4G4_UNORM_PACK8,
+            .extent = evaluation_state.sdf_tile_image_extent,
+            .usage =
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .imageViewType = VK_IMAGE_VIEW_TYPE_3D,
+            .memoryTypeIndex = device_only_memory_type_index,
+        },
+        &evaluation_state.material_sdf_image,
+        &evaluation_state.material_sdf_image_view,
+        &evaluation_state.material_sdf_image_memory);
+
+    VkSamplerCreateInfo sdf_tile_image_sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+
+        .mipLodBias = 0.0f,
+        .anisotropyEnable = VK_FALSE,
+        .maxAnisotropy = 1.0f,
+
+        .compareEnable = VK_FALSE,
+        .compareOp = VK_COMPARE_OP_ALWAYS,
+
+        .minLod = 0.0f,
+        .maxLod = 0.0f, // only one mip level
+
+        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = VK_FALSE,
+    };
+
+    vkCreateSampler(vkDevice, &sdf_tile_image_sampler_info, nullptr,
+                    &evaluation_state.sdf_tile_image_sampler);
+
+    VkSamplerCreateInfo material_sdf_image_sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+
+        .mipLodBias = 0.0f,
+        .anisotropyEnable = VK_FALSE,
+        .maxAnisotropy = 1.0f,
+
+        .compareEnable = VK_FALSE,
+        .compareOp = VK_COMPARE_OP_ALWAYS,
+
+        .minLod = 0.0f,
+        .maxLod = 0.0f, // only one mip level
+
+        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = VK_FALSE,
+    };
+    vkCreateSampler(vkDevice, &material_sdf_image_sampler_info, nullptr,
+                    &evaluation_state.material_sdf_image_sampler);
   }
 
+  // descriptors for sdf_pipeline
   {
     VkDescriptorSetAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = rendering_descriptor_pool,
         .descriptorSetCount = 1,
-        .pSetLayouts = &evaluation_state.descriptor_set_layout,
+        .pSetLayouts = &evaluation_state.sdf_descriptor_set_layout,
     };
 
     CHECK_VK(vkAllocateDescriptorSets(vkDevice, &alloc_info,
-                                      &evaluation_state.descriptor_set));
+                                      &evaluation_state.sdf_descriptor_set));
 
     VkDescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
-        .imageView = evaluation_state.tile_image_view,
+        .imageView = evaluation_state.sdf_tile_image_view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // the layout our image will be
                                                 // at when used by shader
     };
 
-    VkWriteDescriptorSet write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = evaluation_state.descriptor_set,
-        .dstBinding = 0,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-        .pImageInfo = &image_info};
+    VkDescriptorBufferInfo buffer_info = {
+        .buffer = edit_list_buffer,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
+    };
 
-    vkUpdateDescriptorSets(vkDevice, 1, &write, 0, nullptr);
+    VkWriteDescriptorSet writes[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = evaluation_state.sdf_descriptor_set,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &image_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = evaluation_state.sdf_descriptor_set,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &buffer_info,
+        },
+    };
+
+    vkUpdateDescriptorSets(vkDevice, 2, writes, 0, nullptr);
   }
-  VkImageMemoryBarrier2 barrier = {
+
+  // descriptors for materials pipeline
+  {
+    VkDescriptorSetAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = rendering_descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &evaluation_state.materials_descriptor_set_layout,
+    };
+
+    CHECK_VK(vkAllocateDescriptorSets(
+        vkDevice, &alloc_info, &evaluation_state.materials_descriptor_set));
+
+    VkDescriptorImageInfo material_image_info = {
+        .sampler = VK_NULL_HANDLE,
+        .imageView = evaluation_state.material_info_image_view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // the layout our image will be
+                                                // at when used by shader
+    };
+
+    VkDescriptorImageInfo sdf_tile_image_info = {
+        .sampler = evaluation_state.sdf_tile_image_sampler,
+        .imageView = evaluation_state.sdf_tile_image_view,
+        .imageLayout =
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, // the layout our image
+                                                      // will be at when used by
+                                                      // shader
+    };
+
+    VkDescriptorBufferInfo edit_list_buffer_info = {
+        .buffer = edit_list_buffer,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
+    };
+
+    VkDescriptorBufferInfo material_sdf_packed_buffer_info = {
+        .buffer = evaluation_state.material_sdf_packed,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
+    };
+
+    VkWriteDescriptorSet writes[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = evaluation_state.materials_descriptor_set,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &edit_list_buffer_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = evaluation_state.materials_descriptor_set,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &material_image_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = evaluation_state.materials_descriptor_set,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &material_sdf_packed_buffer_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = evaluation_state.materials_descriptor_set,
+            .dstBinding = 3,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &sdf_tile_image_info,
+        },
+    };
+
+    vkUpdateDescriptorSets(vkDevice, 4, writes, 0, nullptr);
+  }
+  barriers[0] = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
 
       .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
@@ -407,7 +773,7 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 
-      .image = evaluation_state.tile_image,
+      .image = evaluation_state.sdf_tile_image,
       .subresourceRange =
           {
               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -417,7 +783,58 @@ VkImageMemoryBarrier2 initialize_evaluation_state() {
               .layerCount = 1,
           },
   };
-  return barrier;
+  barriers[1] = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+      .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+      .srcAccessMask = VK_ACCESS_2_NONE,
+
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstAccessMask =
+          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+      .image = evaluation_state.material_info_image,
+      .subresourceRange =
+          {
+              .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          },
+  };
+  barriers[2] = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+      .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+      .srcAccessMask = VK_ACCESS_2_NONE,
+
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstAccessMask =
+          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+      .image = evaluation_state.material_sdf_image,
+      .subresourceRange =
+          {
+              .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+              .baseMipLevel = 0,
+              .levelCount = 1,
+              .baseArrayLayer = 0,
+              .layerCount = 1,
+          },
+  };
 }
 
 struct InputState {
@@ -905,11 +1322,11 @@ uint32_t tick() {
         .tile_pos = {0.0, 0.0, 0.0},
         .tile_extent =
             {
-                (float)((evaluation_state.tile_image_extent.width - 1) *
+                (float)((evaluation_state.sdf_tile_image_extent.width - 1) *
                         inter_sample_distance),
-                (float)((evaluation_state.tile_image_extent.height - 1) *
+                (float)((evaluation_state.sdf_tile_image_extent.height - 1) *
                         inter_sample_distance),
-                (float)((evaluation_state.tile_image_extent.depth - 1) *
+                (float)((evaluation_state.sdf_tile_image_extent.depth - 1) *
                         inter_sample_distance),
             },
         .resolution = {(float)color_swapchains[i].width,
@@ -1445,6 +1862,26 @@ extern "C" int engine_main(
     assert(found_memory_type);
   }
 
+  // host_visible_memory_type_index
+  // host_visible_memory_type_property_flags
+  {
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(vkPhysicalDevice, &memory_properties);
+
+    bool found_memory_type = false;
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags =
+          memory_properties.memoryTypes[i].propertyFlags;
+      if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+        host_visible_memory_type_index = i;
+        host_visible_memory_type_property_flags = flags;
+        found_memory_type = true;
+        break;
+      }
+    }
+    assert(found_memory_type);
+  }
+
   {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1755,21 +2192,34 @@ extern "C" int engine_main(
                                          &depthDescriptorSetLayoutInfo, nullptr,
                                          &depth_descriptor_set_layout));
 
-    VkDescriptorSetLayoutBinding tile_descriptor_set_layout_binding = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    VkDescriptorSetLayoutBinding rendering_descriptor_set_bindings[] = {
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+        {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+        {
+            .binding = 2,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
     };
 
-    VkDescriptorSetLayoutCreateInfo tile_layout_info = {
+    VkDescriptorSetLayoutCreateInfo rendering_set_layout_create_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings = &tile_descriptor_set_layout_binding,
-    };
+        .bindingCount = 3,
+        .pBindings = rendering_descriptor_set_bindings};
 
-    vkCreateDescriptorSetLayout(vkDevice, &tile_layout_info, nullptr,
-                                &rendering_set_layout);
+    vkCreateDescriptorSetLayout(vkDevice, &rendering_set_layout_create_info,
+                                nullptr, &rendering_set_layout);
 
     VkDescriptorSetLayout set_layouts[] = {color_descriptor_set_layout,
                                            depth_descriptor_set_layout,
@@ -2037,13 +2487,25 @@ extern "C" int engine_main(
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    CHECK_VK(vkBeginCommandBuffer(init_commands, &begin_info));
 
-    auto barrier = initialize_evaluation_state();
+    {
+      create_simple_buffer(
+          SimpleBufferCreateInfo{
+              .size = 0, // TODO,
+              .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+              .memoryTypeIndex = device_only_memory_type_index,
+          },
+          &edit_list_buffer, &edit_list_memory);
+      // TODO write to the buffer
+    }
+
+    CHECK_VK(vkBeginCommandBuffer(init_commands, &begin_info));
+    VkImageMemoryBarrier2 barriers[3];
+    initialize_evaluation_state(barriers);
     VkDependencyInfo depInfo = {
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &barrier,
+        .pImageMemoryBarriers = barriers,
     };
 
     loaded_vkCmdPipelineBarrier2(init_commands, &depInfo);
@@ -2058,7 +2520,7 @@ extern "C" int engine_main(
     CHECK_VK(vkQueueSubmit(vkQueue, 1, &submit_info, VK_NULL_HANDLE));
     vkQueueWaitIdle(vkQueue);
 
-    // descriptor & sampler for tile in rendering shader
+    // descriptors for tile realted resources in rendering shader
     {
       VkDescriptorSetAllocateInfo allocInfo = {
           .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2069,50 +2531,51 @@ extern "C" int engine_main(
 
       vkAllocateDescriptorSets(vkDevice, &allocInfo, &rendering_descriptor_set);
 
-      VkSamplerCreateInfo samplerInfo = {
-          .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-
-          .magFilter = VK_FILTER_LINEAR,
-          .minFilter = VK_FILTER_LINEAR,
-
-          .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-
-          .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-          .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-          .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-
-          .mipLodBias = 0.0f,
-          .anisotropyEnable = VK_FALSE,
-          .maxAnisotropy = 1.0f,
-
-          .compareEnable = VK_FALSE,
-          .compareOp = VK_COMPARE_OP_ALWAYS,
-
-          .minLod = 0.0f,
-          .maxLod = 0.0f, // only one mip level
-
-          .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
-          .unnormalizedCoordinates = VK_FALSE,
-      };
-
-      vkCreateSampler(vkDevice, &samplerInfo, nullptr, &rendering_tile_sampler);
-
       VkDescriptorImageInfo imageInfo = {
-          .sampler = rendering_tile_sampler,
-          .imageView = evaluation_state.tile_image_view,
+          .sampler = evaluation_state.sdf_tile_image_sampler,
+          .imageView = evaluation_state.sdf_tile_image_view,
           .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
       };
+      VkDescriptorImageInfo material_info_image_info = {
+          .imageView = evaluation_state.material_info_image_view,
+          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      };
+      VkDescriptorImageInfo material_sdf_image_info = {
+          .sampler = evaluation_state.material_sdf_image_sampler,
+          .imageView = evaluation_state.material_sdf_image_view,
+          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      };
+      VkWriteDescriptorSet writes[] = {
+          {
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = rendering_descriptor_set,
+              .dstBinding = 0,
+              .dstArrayElement = 0,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+              .pImageInfo = &imageInfo,
+          },
+          {
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = rendering_descriptor_set,
+              .dstBinding = 1,
+              .dstArrayElement = 0,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+              .pImageInfo = &material_info_image_info,
+          },
+          {
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = rendering_descriptor_set,
+              .dstBinding = 2,
+              .dstArrayElement = 0,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+              .pImageInfo = &material_sdf_image_info,
+          },
+      };
 
-      VkWriteDescriptorSet write = {
-          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = rendering_descriptor_set,
-          .dstBinding = 0,
-          .dstArrayElement = 0,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          .pImageInfo = &imageInfo};
-
-      vkUpdateDescriptorSets(vkDevice, 1, &write, 0, nullptr);
+      vkUpdateDescriptorSets(vkDevice, 3, writes, 0, nullptr);
     }
   }
 
@@ -2139,25 +2602,25 @@ extern "C" int engine_main(
 
     vkCmdBindPipeline(evaluation_commands,
                       VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_COMPUTE,
-                      evaluation_state.pipeline);
+                      evaluation_state.sdf_pipeline);
 
     EvaluationPushConstant evaluation_push_constant = {.tile_pos = {0, 0, 0}};
-    vkCmdPushConstants(evaluation_commands, evaluation_state.pipeline_layout,
-                       VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, // offset
-                       sizeof(EvaluationPushConstant),
-                       &evaluation_push_constant);
+    vkCmdPushConstants(
+        evaluation_commands, evaluation_state.sdf_pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0, // offset
+        sizeof(EvaluationPushConstant), &evaluation_push_constant);
 
     vkCmdBindDescriptorSets(evaluation_commands, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            evaluation_state.pipeline_layout,
+                            evaluation_state.sdf_pipeline_layout,
                             0, // firstSet
                             1, // setCount
-                            &evaluation_state.descriptor_set, 0, nullptr);
+                            &evaluation_state.sdf_descriptor_set, 0, nullptr);
 
     vkCmdDispatch(evaluation_commands,
-                  evaluation_state.tile_image_extent.width / 8,
-                  evaluation_state.tile_image_extent.height / 8,
-                  evaluation_state.tile_image_extent.depth / 8);
+                  evaluation_state.sdf_tile_image_extent.width / 8,
+                  evaluation_state.sdf_tile_image_extent.height / 8,
+                  evaluation_state.sdf_tile_image_extent.depth / 8);
 
     // transition the tile image to shader read layout
     {
@@ -2176,7 +2639,7 @@ extern "C" int engine_main(
           .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
           .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 
-          .image = evaluation_state.tile_image,
+          .image = evaluation_state.sdf_tile_image,
           .subresourceRange =
               {
                   .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,

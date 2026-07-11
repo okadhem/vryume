@@ -20,7 +20,7 @@ const int STEP_2_SURFACE = 1; // when this step is done, *most* of two surface v
 const int STEP_3_SURFACE = 2; // when this step is done, all three surface voxels are encoded properly, as well as all the two surface voxels close
 // to three surface voxels, left in a wrong state by preious step.
 
-layout(set = 0, binding = 3, std140) uniform EditsUniformBuffer {
+layout(set = 0, binding = 0, std140) uniform EditsUniformBuffer {
     uint edit_list_size;
     Edit edit_list[4];
 };
@@ -34,7 +34,7 @@ layout(push_constant) uniform PushConstant {
 
 layout(
 set = 0,
-binding = 1, //TODO double check
+binding = 1,
 r8ui
 ) uniform uimage3D tile_voxel_material;
 
@@ -44,6 +44,11 @@ binding = 2
 ) buffer SDFPackedData {
     coherent uint sdf_texels_packed[]; // packed texels with R4G4_UNORM_PACK8 format, R in higher 4 bits
 };
+
+layout(
+set = 0,
+binding = 3
+) uniform sampler3D tile_image;
 
 #include "common.h.glsl"
 

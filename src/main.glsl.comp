@@ -22,8 +22,8 @@ binding = 0
 ) uniform sampler3D tile_image;
 
 layout(
-set = 2, //TODO: what is with the sets ??
-binding = 1, //TODO double check
+set = 2,
+binding = 1,
 r8ui
 ) uniform readonly uimage3D tile_voxel_material;
 

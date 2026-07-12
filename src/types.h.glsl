@@ -2,7 +2,11 @@ struct Edit {
     bool is_removal;
     int material_id;
     uint primitive_type;
-    float param[4];
+    // manual scalar array until we activate standard layout on unifrom buffers
+    float param0;
+    float param1;
+    float param2;
+    float param3;
 
     // transform in model space
     vec4 rotation; // unit quaternion

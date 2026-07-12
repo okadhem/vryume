@@ -7,7 +7,9 @@
 // will have garbage sdf values, therefore, STEP_3_SURFACE must not rely on this sdf values and must override them with the correct ones.
 // said another way, neighbouring voxels that don't have equal mappings will have wrong sdf values.
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+// TODO this layout dimensions are bad, they are too big, but its a hack as it divides the total dispatch_dim
+// size of 999 voxel, we need to pick a good size and do bound checks like normal people
+layout(local_size_x = 9, local_size_y = 9, local_size_z = 9) in;
 
 #include "types.h.glsl"
 

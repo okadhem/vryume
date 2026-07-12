@@ -122,7 +122,7 @@ static uint32_t device_only_memory_type_index;
 static VkMemoryPropertyFlags device_only_memory_type_property_flags;
 static uint32_t host_visible_memory_type_index;
 static VkMemoryPropertyFlags host_visible_memory_type_property_flags;
-static VkDescriptorPool rendering_descriptor_pool;
+static VkDescriptorPool main_descriptor_pool;
 static VkDescriptorSet rendering_descriptor_set;
 static RENDERDOC_API_1_4_1 *renderdoc_api = nullptr;
 static bool capture_frame = false;
@@ -227,6 +227,83 @@ VkShaderModule load_shader_module(const char *file_name) {
 
   return result;
 }
+// keep in sync with shader version untill we find a better way to do this.
+// layout = std140
+struct Edit {
+  uint32_t is_removal;     // offset 0  (GLSL bool = 4 bytes)
+  int32_t material_id;     // offset 4
+  uint32_t primitive_type; // offset 8
+  float param0;            // offset 12
+  float param1;            // offset 16
+  float param2;            // offset 20
+  float param3;            // offset 24
+  uint32_t _padding0;      // offset 28
+  float rotation[4];       // offset 32 (vec4)
+  float translation[3];    // offset 48 (vec3)
+  uint32_t _padding1;      // offset 60
+};
+const uint EDIT_PRIMITIVE_SPHERE = 1;
+const uint EDIT_PRIMITIVE_BOX = 2;
+
+// layout = std140
+struct EditsUniformBuffer {
+  uint32_t edit_list_size;
+  uint32_t _padding0;
+  uint32_t _padding1;
+  uint32_t _padding2;
+  Edit edit_list[4];
+};
+
+VkBufferMemoryBarrier2
+buffer_release_compute_writes_to_compute(VkBuffer buffer) {
+  return {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+      .buffer = buffer,
+      .offset = 0,
+      .size = VK_WHOLE_SIZE,
+  };
+}
+
+VkImageMemoryBarrier2 image_release_compute_writes_to_compute(VkImage image) {
+  return {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+
+      .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+      .image = image,
+      .subresourceRange =
+          {
+              .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+              .baseMipLevel = 0,
+              .levelCount = VK_REMAINING_MIP_LEVELS,
+              .baseArrayLayer = 0,
+              .layerCount = VK_REMAINING_ARRAY_LAYERS,
+          },
+  };
+}
+
 struct SimpleImageCreateInfo {
   VkImageType imageType;
   VkFormat format;
@@ -248,8 +325,7 @@ void create_simple_image(SimpleImageCreateInfo simple_info, VkImage *image,
       .tiling = VK_IMAGE_TILING_OPTIMAL,
       .usage = simple_info.usage,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
-      //
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
   };
 
   CHECK_VK(vkCreateImage(vkDevice, &image_info, nullptr, image));
@@ -326,10 +402,31 @@ void create_simple_buffer(SimpleBufferCreateInfo simple_info, VkBuffer *buffer,
                      0); // Offset
 }
 
+// TODO: these are defined in the shader code, we should find a way to use them
+// and redefine.
+const int STEP_1_SURFACE =
+    0; // when this step is done, all one surface voxels are properly encoded.
+
+const int STEP_2_SURFACE =
+    1; // when this step is done, *most* of two surface voxels are properly
+       // encoded, precisely, all two surface voxels that
+// are away from a three voxel surface, (the line portion away from any
+// intersection). other two surface voxel are encoded with *wrong* data namely
+// wrong configuration, and invalid sdf values, it is the job of STEP_3_SURFACE
+// to fix that.
+
+const int STEP_3_SURFACE =
+    2; // when this step is done, all three surface voxels are encoded properly,
+       // as well as all the two surface voxels close
+// to three surface voxels, left in a wrong state by preious step.
+
 struct MaterialEvaluationPushConstant {
-  float tile_pos[3]; // vec3 alignment=16
-  float _pad; // pad to 16 so than next EvaluationPushConstant value in an array
-              // starts at the correct alignment
+  float tile_pos[3]; // in model space
+  int32 step; // one of STEP_XXX, how many sub surface we should encode in this
+              // shader run. each step assumes the steps before are done.
+  uint32 voxel_texture_width;  // in number of voxels
+  uint32 voxel_texture_height; // in number of voxels
+  float _pad[2];               // pad to 16 align for the struct
 };
 struct EvaluationPushConstant {
   float tile_pos[3]; // vec3 alignment=16
@@ -631,7 +728,7 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
   {
     VkDescriptorSetAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = rendering_descriptor_pool,
+        .descriptorPool = main_descriptor_pool,
         .descriptorSetCount = 1,
         .pSetLayouts = &evaluation_state.sdf_descriptor_set_layout,
     };
@@ -680,7 +777,7 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
   {
     VkDescriptorSetAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = rendering_descriptor_pool,
+        .descriptorPool = main_descriptor_pool,
         .descriptorSetCount = 1,
         .pSetLayouts = &evaluation_state.materials_descriptor_set_layout,
     };
@@ -2352,7 +2449,7 @@ extern "C" int engine_main(
     }
   }
 
-  // rendering_descriptor_pool
+  // main_descriptor_pool
   // a descriptor pool for things that are not present related
   {
     VkDescriptorPoolSize pool_storage_image_size = {
@@ -2373,7 +2470,7 @@ extern "C" int engine_main(
         .pPoolSizes = pool_sizes};
 
     CHECK_VK(vkCreateDescriptorPool(vkDevice, &pool_info, nullptr,
-                                    &rendering_descriptor_pool));
+                                    &main_descriptor_pool));
   }
 
   // openxr actions (input system)
@@ -2488,6 +2585,8 @@ extern "C" int engine_main(
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
+    // edit_list_buffer
+    // edit_list_memory
     {
       create_simple_buffer(
           SimpleBufferCreateInfo{
@@ -2496,7 +2595,32 @@ extern "C" int engine_main(
               .memoryTypeIndex = device_only_memory_type_index,
           },
           &edit_list_buffer, &edit_list_memory);
-      // TODO write to the buffer
+
+      EditsUniformBuffer buf = {
+          .edit_list_size = 3,
+          .edit_list = {{
+              .is_removal = false,
+              .material_id = 1,
+              .primitive_type = EDIT_PRIMITIVE_SPHERE,
+              .param0 = 1,
+          }},
+      };
+
+      void *mapped = nullptr;
+      CHECK_VK(vkMapMemory(vkDevice, edit_list_memory, 0,
+                           sizeof(EditsUniformBuffer), 0, &mapped));
+
+      memcpy(mapped, &buf, sizeof(buf));
+
+      VkMappedMemoryRange range{
+          .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+          .memory = edit_list_memory,
+          .offset = 0,
+          .size = sizeof(EditsUniformBuffer),
+      };
+      CHECK_VK(vkFlushMappedMemoryRanges(vkDevice, 1, &range));
+
+      vkUnmapMemory(vkDevice, edit_list_memory);
     }
 
     CHECK_VK(vkBeginCommandBuffer(init_commands, &begin_info));
@@ -2524,7 +2648,7 @@ extern "C" int engine_main(
     {
       VkDescriptorSetAllocateInfo allocInfo = {
           .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-          .descriptorPool = rendering_descriptor_pool,
+          .descriptorPool = main_descriptor_pool,
           .descriptorSetCount = 1,
           .pSetLayouts = &rendering_set_layout,
       };
@@ -2631,7 +2755,7 @@ extern "C" int engine_main(
           .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
 
           .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-          .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+          .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
 
           .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
           .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2656,6 +2780,83 @@ extern "C" int engine_main(
       };
 
       loaded_vkCmdPipelineBarrier2(evaluation_commands, &depInfo);
+    }
+
+    // material evaluation commands
+    {
+      uint32 texture_voxel_width =
+          evaluation_state.sdf_tile_image_extent.width - 1;
+      uint32 texture_voxel_height =
+          evaluation_state.sdf_tile_image_extent.height - 1;
+      uint32 texture_voxel_depth =
+          evaluation_state.sdf_tile_image_extent.depth - 1;
+
+      vkCmdBindPipeline(evaluation_commands,
+                        VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_COMPUTE,
+                        evaluation_state.materials_pipeline);
+
+      // step 1
+      MaterialEvaluationPushConstant material_push_constants = {
+          .step = STEP_1_SURFACE,
+          .tile_pos = {0, 0, 0},
+          .voxel_texture_width = texture_voxel_width,
+          .voxel_texture_height = texture_voxel_height,
+      };
+
+      vkCmdPushConstants(
+          evaluation_commands, evaluation_state.materials_pipeline_layout,
+          VK_SHADER_STAGE_COMPUTE_BIT,
+          0, // offset
+          sizeof(MaterialEvaluationPushConstant), &material_push_constants);
+
+      vkCmdDispatch(evaluation_commands, texture_voxel_width / 9,
+                    texture_voxel_height / 9, texture_voxel_depth / 9);
+      {
+        VkImageMemoryBarrier2 img_barrier =
+            image_release_compute_writes_to_compute(
+                evaluation_state.material_info_image);
+        VkBufferMemoryBarrier2 buf_barrier =
+            buffer_release_compute_writes_to_compute(
+                evaluation_state.material_sdf_packed);
+
+        VkDependencyInfo depInfo = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &img_barrier,
+            .pBufferMemoryBarriers = &buf_barrier,
+            .bufferMemoryBarrierCount = 1,
+        };
+        loaded_vkCmdPipelineBarrier2(evaluation_commands, &depInfo);
+      }
+
+      // step 2
+      material_push_constants.step = STEP_2_SURFACE;
+      vkCmdPushConstants(
+          evaluation_commands, evaluation_state.materials_pipeline_layout,
+          VK_SHADER_STAGE_COMPUTE_BIT,
+          0, // offset
+          sizeof(MaterialEvaluationPushConstant), &material_push_constants);
+
+      vkCmdDispatch(evaluation_commands, texture_voxel_width / 9,
+                    texture_voxel_height / 9, texture_voxel_depth / 9);
+      {
+        VkImageMemoryBarrier2 img_barrier =
+            image_release_compute_writes_to_compute(
+                evaluation_state.material_info_image);
+        VkBufferMemoryBarrier2 buf_barrier =
+            buffer_release_compute_writes_to_compute(
+                evaluation_state.material_sdf_packed);
+
+        VkDependencyInfo depInfo = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &img_barrier,
+            .pBufferMemoryBarriers = &buf_barrier,
+            .bufferMemoryBarrierCount = 1,
+        };
+        loaded_vkCmdPipelineBarrier2(evaluation_commands, &depInfo);
+      }
+      // step 3
     }
 
     CHECK_VK(vkEndCommandBuffer(evaluation_commands));
@@ -2712,3 +2913,9 @@ int main() {
   return 0;
 }
 #endif
+
+// TODO:
+// Pools, OK
+// push constants: main.glsl and evalulation did not change - all done
+// writing the edit list -- need to proper scene
+// commands: missing step 3

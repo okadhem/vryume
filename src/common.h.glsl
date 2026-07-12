@@ -79,11 +79,11 @@ float evaluate_primitive(Edit edit, vec3 pos) {
     vec3 edit_local_pos = rotate_by_quat(inverse_unit_quat(edit.rotation), pos - edit.translation);
     switch (edit.primitive_type) {
         case EDIT_PRIMITIVE_SPHERE:
-        return sd_sphere(edit_local_pos, edit.param[0]);
+        return sd_sphere(edit_local_pos, edit.param0);
         break;
 
         case EDIT_PRIMITIVE_BOX:
-        return sd_box(edit_local_pos, vec3(edit.param[0], edit.param[1], edit.param[2]));
+        return sd_box(edit_local_pos, vec3(edit.param0, edit.param1, edit.param2));
         break;
     }
     // TODO panic

@@ -2795,6 +2795,13 @@ extern "C" int engine_main(
                         VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_COMPUTE,
                         evaluation_state.materials_pipeline);
 
+      vkCmdBindDescriptorSets(
+          evaluation_commands, VK_PIPELINE_BIND_POINT_COMPUTE,
+          evaluation_state.materials_pipeline_layout,
+          0, // firstSet
+          1, // setCount
+          &evaluation_state.materials_descriptor_set, 0, nullptr);
+
       // step 1
       MaterialEvaluationPushConstant material_push_constants = {
           .step = STEP_1_SURFACE,
@@ -2857,6 +2864,115 @@ extern "C" int engine_main(
         loaded_vkCmdPipelineBarrier2(evaluation_commands, &depInfo);
       }
       // step 3
+      material_push_constants.step = STEP_3_SURFACE;
+      vkCmdPushConstants(
+          evaluation_commands, evaluation_state.materials_pipeline_layout,
+          VK_SHADER_STAGE_COMPUTE_BIT,
+          0, // offset
+          sizeof(MaterialEvaluationPushConstant), &material_push_constants);
+
+      vkCmdDispatch(evaluation_commands, texture_voxel_width / 9,
+                    texture_voxel_height / 9, texture_voxel_depth / 9);
+
+      // prepare the buffer and image for the copy
+      {
+        // before any copy operation writes this image, perform the layout
+        // transition.
+        VkImageMemoryBarrier2 image_barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+            .srcAccessMask = 0,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+            .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image = evaluation_state.material_sdf_image,
+            .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .subresourceRange.levelCount = 1,
+            .subresourceRange.layerCount = 1,
+        };
+
+        VkBufferMemoryBarrier2 buffer_barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+            .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+            .buffer = evaluation_state.material_sdf_packed,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+
+        VkDependencyInfo depInfo = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &image_barrier,
+            .pBufferMemoryBarriers = &buffer_barrier,
+            .bufferMemoryBarrierCount = 1,
+        };
+        loaded_vkCmdPipelineBarrier2(evaluation_commands, &depInfo);
+      }
+
+      VkBufferImageCopy region{
+          region.bufferOffset = 0,
+          // 0 = tightly packed
+          .bufferRowLength = 0,
+          .bufferImageHeight = 0,
+          .imageSubresource =
+              {
+                  .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                  .mipLevel = 0,
+                  .baseArrayLayer = 0,
+                  .layerCount = 1,
+              },
+          .imageOffset = {0, 0, 0},
+          .imageExtent = evaluation_state.sdf_tile_image_extent,
+      };
+
+      vkCmdCopyBufferToImage(evaluation_commands,
+                             evaluation_state.material_sdf_packed,
+                             evaluation_state.material_sdf_image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+      // make material images available for later compute shader renderer work
+      {
+        VkImageMemoryBarrier2 barriers[] = {
+            {
+                // material_sdf_barrier
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .image = evaluation_state.material_sdf_image,
+                .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .subresourceRange.levelCount = 1,
+                .subresourceRange.layerCount = 1,
+            },
+            {
+                // material_info_barrier
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .image = evaluation_state.material_sdf_image,
+                .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .subresourceRange.levelCount = 1,
+                .subresourceRange.layerCount = 1,
+            },
+        };
+        VkDependencyInfo depInfo = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 2,
+            .pImageMemoryBarriers = barriers,
+        };
+        loaded_vkCmdPipelineBarrier2(evaluation_commands, &depInfo);
+      }
     }
 
     CHECK_VK(vkEndCommandBuffer(evaluation_commands));
@@ -2918,4 +3034,4 @@ int main() {
 // Pools, OK
 // push constants: main.glsl and evalulation did not change - all done
 // writing the edit list -- need to proper scene
-// commands: missing step 3
+// commands: missing step 3 -- done

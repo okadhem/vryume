@@ -12,6 +12,7 @@ const float max_surface_penetration = -sqrt(3) * grad_epsilon; // sqrt(3) is the
 const float min_representable_distance = max_surface_penetration + (-sqrt(3) * inter_sample_distance);
 const float encoded_distance_resolution = 0.0002; // in m
 const float max_representable_distance = min_representable_distance + 255.0 * encoded_distance_resolution;
+const float encoded_distance_error = encoded_distance_resolution * 0.5;
 
 // inverse of glsl mix function
 // given x in [a,b] return the interpolation parameter in range [0, 1]
@@ -38,6 +39,7 @@ uint norm_float_to_4bit_uint(float v) {
 const float max_representable_distance_4bits = sqrt(3) * inter_sample_distance;
 const float min_representable_distance_4bits = -max_representable_distance_4bits;
 const float encoded_distance_resolution_4bits = (max_representable_distance_4bits - min_representable_distance_4bits) / 15.0;
+const float encoded_distance_error_4bits = encoded_distance_resolution_4bits * 0.5;
 
 float encode_distance_4bits(float distance) {
     // not sure clamping is needed here, algorithm only encodes distances near the surfaces.

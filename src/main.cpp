@@ -2590,7 +2590,7 @@ extern "C" int engine_main(
     {
       create_simple_buffer(
           SimpleBufferCreateInfo{
-              .size = 0, // TODO,
+              .size = sizeof(EditsUniformBuffer),
               .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
               .memoryTypeIndex = device_only_memory_type_index,
           },
@@ -2598,12 +2598,30 @@ extern "C" int engine_main(
 
       EditsUniformBuffer buf = {
           .edit_list_size = 3,
-          .edit_list = {{
-              .is_removal = false,
-              .material_id = 1,
-              .primitive_type = EDIT_PRIMITIVE_SPHERE,
-              .param0 = 1,
-          }},
+          .edit_list =
+              {
+                  {
+                      .is_removal = false,
+                      .material_id = 1,
+                      .primitive_type = EDIT_PRIMITIVE_SPHERE,
+                      .param0 = 0.25,
+                      .translation = {1.0, 0.5, 1.1},
+                  },
+                  {
+                      .is_removal = false,
+                      .material_id = 2,
+                      .primitive_type = EDIT_PRIMITIVE_SPHERE,
+                      .param0 = 0.25,
+                      .translation = {1.0, 1.0, 1.1},
+                  },
+                  {
+                      .is_removal = false,
+                      .material_id = 3,
+                      .primitive_type = EDIT_PRIMITIVE_SPHERE,
+                      .param0 = 0.25,
+                      .translation = {1.0, 1.5, 1.1},
+                  },
+              },
       };
 
       void *mapped = nullptr;
@@ -3033,5 +3051,6 @@ int main() {
 // TODO:
 // Pools, OK
 // push constants: main.glsl and evalulation did not change - all done
-// writing the edit list -- need to proper scene
+// writing the edit list -- need to proper scene -- done
 // commands: missing step 3 -- done
+// init the material info image with a proper "null" value

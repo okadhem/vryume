@@ -471,11 +471,39 @@ void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials
 }
 
 void main() {
-    //TODO: early exit if we are in a voxel not intersecting object surface
     //TODO: we should handle multi primitive same material here, i am thinking just union the surfaces of material, but i am still not sure.
 
     ivec3 invocation_voxel_id = ivec3(gl_GlobalInvocationID.xyz);
     vec3 invocation_position = pc.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
+
+    // we should probably early exit if we the voxel is not near the surface for performance reasons
+    // something like the block bellow:
+    // however because this check relies on the encoded distance produced by the evaluation, it will have
+    // encoding errors, meaning that some voxel will be go through even if they don't hit the object surface
+    // the algorithm following this must support that possibility (TODO check that).
+    //{
+    //    bool negative_distance = false;
+    //    bool positive_distance = false;
+    //    for (int k = 0; k <= 1; ++k)
+    //        for (int j = 0; j <= 1; ++j)
+    //            for (int i = 0; i <= 1; ++i) {
+    //                ivec3 offset = ivec3(i, j, k);
+    //                uint d = decode_distance(imageLoad(tile_image, invocation_voxel_id + offset).r);
+    //                if (d < -encoded_distance_error) {
+    //                    negative_distance = true;
+    //                } else if (d > encoded_distance_error) {
+    //                    positive_distance = true;
+    //                } else if (d >= -encoded_distance_error && d <= encoded_distance_error) {
+    //                    // we can't know the pre encoding distance sign, so we assume this voxel is intersecting the surface
+    //                    // and continue shader invocation
+    //                    negative_distance = true;
+    //                    positive_distance = true;
+    //                }
+    //            }
+    //    if (!(negative_distance && positive_distance)) {
+    //        return;
+    //    }
+    //}
 
     uint primitive_hit = 0;
 

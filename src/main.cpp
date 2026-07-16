@@ -3053,4 +3053,4 @@ int main() {
 // push constants: main.glsl and evalulation did not change - all done
 // writing the edit list -- need to proper scene -- done
 // commands: missing step 3 -- done
-// init the material info image with a proper "null" value
+// init the material info image with a proper "null" value -- done

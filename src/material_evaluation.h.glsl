@@ -1,3 +1,7 @@
+
+//TODO: TWO_SURFACE_VOXEL_2 is now used for things unrealted to two surface voxels, like a marker
+// for null voxel info, update the comment bellow.
+
 // Each voxel material byte is made of a header and a payload:
 // header (2 bits): ONE_SURFACE_VOXEL, TWO_SURFACE_VOXEL_1, TWO_SURFACE_VOXEL_2, THREE_SURFACE_VOXEL
 // ONE_SURFACE_VOXEL, payload(6 bits) = material_id
@@ -20,9 +24,13 @@ const uint ONE_SURFACE_VOXEL_HEADER = 0u; // 0b00000000u;
 const uint TWO_SURFACE_VOXEL_1_HEADER = 0x40u; // 0b01000000u;
 const uint TWO_SURFACE_VOXEL_C12_CONFIG = 0x40u; // 0b01000000u;
 const uint TWO_SURFACE_VOXEL_C13_CONFIG = 0x60u; //0b01100000u;
-const uint TWO_SURFACE_VOXEL_2_HEADER = 0x80u; //0b10000000u;
+// TWO_SURFACE_VOXEL_2_HEADER no longer to be used
+//const uint TWO_SURFACE_VOXEL_2_HEADER = 0x80u; //0b10000000u;
 const uint TWO_SURFACE_VOXEL_C23_CONFIG = 0x80u; //0b10000000u;
 const uint THREE_SURFACE_VOXEL_HEADER = 0xC0u; //0b11000000u;
+
+//voxel value for the uninitialized state of a voxel.
+const uint NULL_VOXEL = 0xA0; //0b10100000u
 
 // converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
 uint coord_to_neighbour_id(ivec3 c) {

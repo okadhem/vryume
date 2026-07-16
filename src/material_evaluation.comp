@@ -367,7 +367,7 @@ void write_third_surface_inner_loop(ivec3 v, uint v_prime_mapping[3], float v_pr
                 if ((neighbour_texel & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
                     continue;
                 }
-                if ((neighbour_texel & HEADER_MASK) == TWO_SURFACE_VOXEL_1_HEADER || (neighbour_texel & HEADER_MASK) == TWO_SURFACE_VOXEL_2_HEADER) {
+                if ((neighbour_texel & HEADER_MASK) == TWO_SURFACE_VOXEL_1_HEADER || (neighbour_texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG) {
                     uint[2] neighbour_materials = read_2_surface_voxel_material_id(v + offset);
                     sort2(neighbour_materials);
 
@@ -475,6 +475,12 @@ void main() {
 
     ivec3 invocation_voxel_id = ivec3(gl_GlobalInvocationID.xyz);
     vec3 invocation_position = pc.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
+
+    // initialize the all the voxel info before doing any work in step 1 or any of the following steps
+    // or the algorithm could read garbage data. probably done better with a clear command.
+    if (pc.step == STEP_1_SURFACE) {
+        imageStore(tile_voxel_material, invocation_voxel_id, uvec4(NULL_VOXEL, 0u, 0u, 0u));
+    }
 
     // we should probably early exit if we the voxel is not near the surface for performance reasons
     // something like the block bellow:

@@ -122,6 +122,9 @@ static uint32_t device_only_memory_type_index;
 static VkMemoryPropertyFlags device_only_memory_type_property_flags;
 static uint32_t host_visible_memory_type_index;
 static VkMemoryPropertyFlags host_visible_memory_type_property_flags;
+static uint32_t device_local_host_visible_memory_type_index;
+static VkMemoryPropertyFlags
+    device_local_host_visible_memory_type_property_flags;
 static VkDescriptorPool main_descriptor_pool;
 static VkDescriptorSet rendering_descriptor_set;
 static RENDERDOC_API_1_4_1 *renderdoc_api = nullptr;
@@ -314,6 +317,7 @@ struct SimpleImageCreateInfo {
 };
 void create_simple_image(SimpleImageCreateInfo simple_info, VkImage *image,
                          VkImageView *image_view, VkDeviceMemory *memory) {
+  printf("create_simple_image\n");
   VkImageCreateInfo image_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = simple_info.imageType,
@@ -625,7 +629,7 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
     create_simple_image(
         SimpleImageCreateInfo{
             .imageType = VK_IMAGE_TYPE_3D,
-            .format = VK_FORMAT_R8_UNORM,
+            .format = VK_FORMAT_R8_UINT,
             // TODO image size must be divisible by shader group size, we
             // need a way to make this less error prone
             .extent = material_info_extent,
@@ -1969,7 +1973,8 @@ extern "C" int engine_main(
     for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
       VkMemoryPropertyFlags flags =
           memory_properties.memoryTypes[i].propertyFlags;
-      if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+      if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+          !(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         host_visible_memory_type_index = i;
         host_visible_memory_type_property_flags = flags;
         found_memory_type = true;
@@ -1977,6 +1982,28 @@ extern "C" int engine_main(
       }
     }
     assert(found_memory_type);
+  }
+
+  // device_local_host_visible_memory_type_index
+  // device_local_host_visible_memory_type_property_flags
+  {
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(vkPhysicalDevice, &memory_properties);
+
+    bool found_memory_type = false;
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags =
+          memory_properties.memoryTypes[i].propertyFlags;
+      if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+          (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        device_local_host_visible_memory_type_index = i;
+        device_local_host_visible_memory_type_property_flags = flags;
+        found_memory_type = true;
+        break;
+      }
+    }
+    assert(found_memory_type);
+    printf("memory id: %d\n", device_local_host_visible_memory_type_index);
   }
 
   {
@@ -2592,7 +2619,7 @@ extern "C" int engine_main(
           SimpleBufferCreateInfo{
               .size = sizeof(EditsUniformBuffer),
               .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-              .memoryTypeIndex = device_only_memory_type_index,
+              .memoryTypeIndex = device_local_host_visible_memory_type_index,
           },
           &edit_list_buffer, &edit_list_memory);
 
@@ -2977,8 +3004,8 @@ extern "C" int engine_main(
                 .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                 .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
                 .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .image = evaluation_state.material_sdf_image,
+                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .image = evaluation_state.material_info_image,
                 .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                 .subresourceRange.levelCount = 1,
                 .subresourceRange.layerCount = 1,

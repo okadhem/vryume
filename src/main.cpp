@@ -132,6 +132,7 @@ static bool capture_frame = false;
 
 static VkBuffer edit_list_buffer;
 static VkDeviceMemory edit_list_memory;
+static VkMemoryRequirements edit_list_memory_requirements;
 
 // the transform is the rotation followed by the translation
 struct RigidTransform {
@@ -371,6 +372,7 @@ void create_simple_image(SimpleImageCreateInfo simple_info, VkImage *image,
 
   };
   CHECK_VK(vkCreateImageView(vkDevice, &image_view_info, nullptr, image_view));
+  printf("created simple image, VkImage:%x\n", *image);
 }
 
 struct SimpleBufferCreateInfo {
@@ -379,7 +381,8 @@ struct SimpleBufferCreateInfo {
   uint32 memoryTypeIndex;
 };
 void create_simple_buffer(SimpleBufferCreateInfo simple_info, VkBuffer *buffer,
-                          VkDeviceMemory *memory) {
+                          VkDeviceMemory *memory,
+                          VkMemoryRequirements *memory_requirements) {
   VkBufferCreateInfo create_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = simple_info.size,
@@ -389,15 +392,14 @@ void create_simple_buffer(SimpleBufferCreateInfo simple_info, VkBuffer *buffer,
   };
   CHECK_VK(vkCreateBuffer(vkDevice, &create_info, nullptr, buffer));
 
-  VkMemoryRequirements memory_requirements;
-  vkGetBufferMemoryRequirements(vkDevice, *buffer, &memory_requirements);
+  vkGetBufferMemoryRequirements(vkDevice, *buffer, memory_requirements);
 
-  assert(memory_requirements.memoryTypeBits &
+  assert((*memory_requirements).memoryTypeBits &
          (1u << simple_info.memoryTypeIndex));
 
   VkMemoryAllocateInfo alloc_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = memory_requirements.size,
+      .allocationSize = (*memory_requirements).size,
       .memoryTypeIndex = simple_info.memoryTypeIndex,
   };
   CHECK_VK(vkAllocateMemory(vkDevice, &alloc_info, nullptr, memory));
@@ -460,6 +462,7 @@ struct EvaluationState {
 
   VkBuffer material_sdf_packed;
   VkDeviceMemory material_sdf_packed_memory;
+  VkMemoryRequirements material_sdf_packed_memory_requirements;
 
   VkImageView material_sdf_image_view;
   VkImage material_sdf_image;
@@ -646,7 +649,8 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
             .size = evaluation_state.sdf_tile_image_extent.width *
                     evaluation_state.sdf_tile_image_extent.height *
                     evaluation_state.sdf_tile_image_extent.depth,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             .memoryTypeIndex =
                 host_visible_memory_type_index, // only GPU will use this, yet
                                                 // we do this to get a page in
@@ -654,7 +658,8 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
                                                 // pressure
         },
         &evaluation_state.material_sdf_packed,
-        &evaluation_state.material_sdf_packed_memory);
+        &evaluation_state.material_sdf_packed_memory,
+        &evaluation_state.material_sdf_packed_memory_requirements);
 
     create_simple_image(
         SimpleImageCreateInfo{
@@ -1408,6 +1413,9 @@ uint32_t tick() {
       eye_pose_world = compose_transfrom(stage_pose_world, eye_pose_stage);
     }
 
+    // printf("eye_pos_world: %f,%f,%f\n", eye_pose_world.translation.x,
+    //        eye_pose_world.translation.y, eye_pose_world.translation.z);
+    eye_pose_world.translation = vec3(0.859198, 1.173761, 1.817214);
     RenderingPushConstant rendering_push_constant = {
         .camera_orientation_world = {eye_pose_world.rotation.x,
                                      eye_pose_world.rotation.y,
@@ -1456,7 +1464,7 @@ uint32_t tick() {
               .dstAccessMask = VK_ACCESS_2_NONE,
 
               .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-              .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+              .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 
               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -2621,7 +2629,7 @@ extern "C" int engine_main(
               .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
               .memoryTypeIndex = device_local_host_visible_memory_type_index,
           },
-          &edit_list_buffer, &edit_list_memory);
+          &edit_list_buffer, &edit_list_memory, &edit_list_memory_requirements);
 
       EditsUniformBuffer buf = {
           .edit_list_size = 3,
@@ -2653,7 +2661,7 @@ extern "C" int engine_main(
 
       void *mapped = nullptr;
       CHECK_VK(vkMapMemory(vkDevice, edit_list_memory, 0,
-                           sizeof(EditsUniformBuffer), 0, &mapped));
+                           edit_list_memory_requirements.size, 0, &mapped));
 
       memcpy(mapped, &buf, sizeof(buf));
 
@@ -2661,7 +2669,7 @@ extern "C" int engine_main(
           .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
           .memory = edit_list_memory,
           .offset = 0,
-          .size = sizeof(EditsUniformBuffer),
+          .size = VK_WHOLE_SIZE,
       };
       CHECK_VK(vkFlushMappedMemoryRanges(vkDevice, 1, &range));
 
@@ -2673,7 +2681,7 @@ extern "C" int engine_main(
     initialize_evaluation_state(barriers);
     VkDependencyInfo depInfo = {
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
+        .imageMemoryBarrierCount = 3, // TODO find a way less error prone
         .pImageMemoryBarriers = barriers,
     };
 
@@ -2707,7 +2715,9 @@ extern "C" int engine_main(
       };
       VkDescriptorImageInfo material_info_image_info = {
           .imageView = evaluation_state.material_info_image_view,
-          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          .imageLayout =
+              VK_IMAGE_LAYOUT_GENERAL, // even if we readonly, READ_ONLY_OPTIMAL
+                                       // is for sampled images
       };
       VkDescriptorImageInfo material_sdf_image_info = {
           .sampler = evaluation_state.material_sdf_image_sampler,
@@ -3004,7 +3014,7 @@ extern "C" int engine_main(
                 .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                 .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
                 .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
                 .image = evaluation_state.material_info_image,
                 .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                 .subresourceRange.levelCount = 1,

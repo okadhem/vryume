@@ -323,6 +323,19 @@ void main() {
     vec3 light_direction_world = normalize(vec3(1.0, 1.0, 1.0)); // from surface to light source
     vec3 light_color = vec3(1.0, 1.0, 1.0);
     vec3 object_color = vec3(1.0, 0.0, 0.0);
+    switch (material_id) {
+        case 1:
+        object_color = vec3(1.0, 1.0, 0.0); // yellow
+        break;
+        case 2:
+        object_color = vec3(1.0, 0.0, 0.0);
+        break;
+        case 3:
+        object_color = vec3(0.0, 0.0, 1.0);
+        break;
+        default:
+        object_color = vec3(0.0, 1.0, 0.0);
+    }
     vec3 diffuse = light_color * object_color * max(dot(normal_world, light_direction_world), 0.0);
 
     vec3 reflected_light_world = reflect(-light_direction_world, normal_world); // from surface to reflected direction

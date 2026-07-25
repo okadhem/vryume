@@ -967,9 +967,13 @@ struct RenderingPushConstant {
   float tile_extent[3];
   float _pad3;
   float resolution[2]; // starts at 80
-  float _pad4[2];      // to align struct to 16
+  float _pad4[2];
+  uint32
+      tile_extent_voxels[3]; // number of voxels in each direction, starts at 96
+  float _pad5;               // to align struct to 16
 };
-static_assert(sizeof(RenderingPushConstant) == 96);
+static_assert(sizeof(RenderingPushConstant) == 112);
+static_assert(sizeof(RenderingPushConstant) % 16 == 0);
 static_assert(sizeof(RenderingPushConstant) < 128, "PushConstant limit");
 
 static bool is_xr_session_running = false;
@@ -1415,7 +1419,7 @@ uint32_t tick() {
 
     // printf("eye_pos_world: %f,%f,%f\n", eye_pose_world.translation.x,
     //        eye_pose_world.translation.y, eye_pose_world.translation.z);
-    eye_pose_world.translation = vec3(0.859198, 1.173761, 1.817214);
+    // eye_pose_world.translation = vec3(0.859198, 1.173761, 1.817214);
     RenderingPushConstant rendering_push_constant = {
         .camera_orientation_world = {eye_pose_world.rotation.x,
                                      eye_pose_world.rotation.y,
@@ -1440,6 +1444,12 @@ uint32_t tick() {
             },
         .resolution = {(float)color_swapchains[i].width,
                        (float)color_swapchains[i].height},
+        .tile_extent_voxels =
+            {
+                evaluation_state.sdf_tile_image_extent.width - 1,
+                evaluation_state.sdf_tile_image_extent.height - 1,
+                evaluation_state.sdf_tile_image_extent.depth - 1,
+            },
 
     };
     vkCmdPushConstants(command_buffers[i], pipelineLayout,
@@ -2760,6 +2770,11 @@ extern "C" int engine_main(
 
   // evaluate SDF
   {
+
+    if (renderdoc_api) {
+      // renderdoc_api->StartFrameCapture(NULL, NULL);
+    }
+
     CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
     VkCommandBuffer evaluation_commands;
     VkCommandBufferAllocateInfo alloc_info = {
@@ -3041,6 +3056,10 @@ extern "C" int engine_main(
 
     // TODO: we should probably not use the queue idle here
     vkQueueWaitIdle(vkQueue);
+
+    if (renderdoc_api) {
+      // renderdoc_api->EndFrameCapture(NULL, NULL);
+    }
   }
 
   stage_pose_world = RigidTransform{

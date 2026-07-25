@@ -39,6 +39,7 @@ layout(std430, push_constant) uniform PushConstant {
     vec3 tile_pos; // in model space
     vec3 tile_extent; // in m
     vec2 resolution; // (width,height)
+    uvec3 tile_extent_voxels;
 } pc;
 
 #include "common.h.glsl"
@@ -250,7 +251,7 @@ void main() {
 
     uint material_id;
     {
-        ivec3 voxel_id = ivec3(vec3(dispatch_dim - uvec3(1, 1, 1)) * ray_tip_norm);
+        ivec3 voxel_id = ivec3(pc.tile_extent_voxels * ray_tip_norm);
         uint material_info = imageLoad(tile_voxel_material, voxel_id).r;
         if ((material_info & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
             material_id = material_info & ~HEADER_MASK;
@@ -324,6 +325,9 @@ void main() {
     vec3 light_color = vec3(1.0, 1.0, 1.0);
     vec3 object_color = vec3(1.0, 0.0, 0.0);
     switch (material_id) {
+        case 0:
+        object_color = vec3(0.9, 0.0, 1.0);
+        break;
         case 1:
         object_color = vec3(1.0, 1.0, 0.0); // yellow
         break;

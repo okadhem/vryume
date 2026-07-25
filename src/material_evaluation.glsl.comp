@@ -328,8 +328,8 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf) 
     }
 }
 
-void write_first_surface(ivec3 voxel_id, uint[3] ordered_materials) {
-    uint data = ONE_SURFACE_VOXEL_HEADER | (ordered_materials[0] & (~HEADER_MASK));
+void write_first_surface(ivec3 voxel_id, uint material_id) {
+    uint data = ONE_SURFACE_VOXEL_HEADER | (material_id & (~HEADER_MASK));
     imageStore(tile_voxel_material, voxel_id, uvec4(data, 0u, 0u, 0u));
 }
 
@@ -546,8 +546,6 @@ void main() {
         }
     }
 
-    sort_asc_material_id(material_ids, sdfs);
-
     if (primitive_hit > 3) {
         // should not happen under geometry assumptions
         // TODO handle multi primitive same material
@@ -556,18 +554,29 @@ void main() {
     switch (pc.step) {
         case STEP_1_SURFACE:
         if (primitive_hit == 1) {
-            write_first_surface(invocation_voxel_id, material_ids);
+            write_first_surface(invocation_voxel_id, material_ids[0]);
         }
         break;
 
         case STEP_2_SURFACE:
         if (primitive_hit == 2) {
+            if (material_ids[0] > material_ids[1]) {
+                // swap the two material an sdf
+                uint t = material_ids[0];
+                material_ids[0] = material_ids[1];
+                material_ids[1] = t;
+
+                float tmp_sdf[8] = sdfs[0];
+                sdfs[0] = sdfs[1];
+                sdfs[1] = tmp_sdf;
+            }
             write_second_surface(invocation_voxel_id, material_ids, sdfs);
         }
         break;
 
         case STEP_3_SURFACE:
         if (primitive_hit == 3) {
+            sort_asc_material_id(material_ids, sdfs);
             write_third_surface(invocation_voxel_id, material_ids, sdfs);
         }
         break;

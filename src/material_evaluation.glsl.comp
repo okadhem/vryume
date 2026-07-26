@@ -97,11 +97,11 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf_mapping) 
             width * height + width, // (0,1,1)
             width * height + width + 1 // (1,1,1)
         );
-    uint zero_offset_index = v.x + v.y * width + v.z * width * height;
+    uint zero_offset_index = v.x + v.y * width + v.z * width * height; // index in texels
 
     uint[8] current_value;
     for (int i = 0; i < 8; i++) {
-        uint sample_buffer_index = zero_offset_index + offsets[i];
+        uint sample_buffer_index = zero_offset_index + offsets[i]; // in texels
 
         // we use atomic writes that require the location to be 4 byte aligned
         uint atomic_word_index = sample_buffer_index / 4;
@@ -109,7 +109,7 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf_mapping) 
 
         // CAS loop
         for (; ; ) {
-            uint current_value = atomicAdd(sdf_texels_packed[sample_buffer_index], 0);
+            uint current_value = atomicAdd(sdf_texels_packed[atomic_word_index], 0);
             uint new_value = current_value;
             if (voxel_mapping[0] != UNMAPPED_CHANNEL) {
                 // channel 0 stored in low bits, G channel
@@ -127,7 +127,7 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf_mapping) 
             }
             // channel 2 is not written to the buffer, it is implied to be the total object sdf.
 
-            uint value_before_write = atomicCompSwap(sdf_texels_packed[sample_buffer_index], current_value, new_value);
+            uint value_before_write = atomicCompSwap(sdf_texels_packed[atomic_word_index], current_value, new_value);
             if (value_before_write == current_value) {
                 break;
             }

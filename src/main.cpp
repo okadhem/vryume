@@ -1114,11 +1114,6 @@ uint32_t tick() {
   }
 
   // should we ? assert(_out_view_count == viewCount);
-  bool frame_capture_ongoing = false;
-  if (renderdoc_api && capture_frame) {
-    renderdoc_api->StartFrameCapture(NULL, NULL);
-    frame_capture_ongoing = true;
-  }
 
   XrFrameBeginInfo frame_begin_info = {
       .type = XR_TYPE_FRAME_BEGIN_INFO,
@@ -1127,6 +1122,12 @@ uint32_t tick() {
 
   CHECK_VK(
       vkWaitForFences(vkDevice, viewCount, fence_exec, VK_TRUE, UINT64_MAX));
+
+  bool frame_capture_ongoing = false;
+  if (renderdoc_api && capture_frame) {
+    renderdoc_api->StartFrameCapture(NULL, NULL);
+    frame_capture_ongoing = true;
+  }
 
   CHECK_VK(vkResetFences(vkDevice, viewCount, fence_exec));
   CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
@@ -1417,9 +1418,14 @@ uint32_t tick() {
       eye_pose_world = compose_transfrom(stage_pose_world, eye_pose_stage);
     }
 
-    // printf("eye_pos_world: %f,%f,%f\n", eye_pose_world.translation.x,
-    //        eye_pose_world.translation.y, eye_pose_world.translation.z);
+    printf("eye_pos_world: %f,%f,%f\n", eye_pose_world.translation.x,
+           eye_pose_world.translation.y, eye_pose_world.translation.z);
     // eye_pose_world.translation = vec3(0.859198, 1.173761, 1.817214);
+    // printf("eye_pos_world: %f,%f,%f,%f\n", eye_pose_world.rotation.x,
+    //        eye_pose_world.rotation.y, eye_pose_world.rotation.z,
+    //        eye_pose_world.rotation.w);
+    // eye_pose_world.rotation = quat(-0.96533, 0.17188, 0.1964, -0.00273);
+
     RenderingPushConstant rendering_push_constant = {
         .camera_orientation_world = {eye_pose_world.rotation.x,
                                      eye_pose_world.rotation.y,
@@ -1616,6 +1622,7 @@ uint32_t tick() {
   CHECK_XR(xrEndFrame(session, &frame_end_info));
 
   if (renderdoc_api && frame_capture_ongoing) {
+    vkQueueWaitIdle(vkQueue);
     renderdoc_api->EndFrameCapture(NULL, NULL);
     frame_capture_ongoing = false;
     capture_frame = false;
@@ -1889,6 +1896,17 @@ extern "C" int engine_main(
     };
     CHECK_XR(xrGetVulkanGraphicsDevice2KHR(instance, &xr_vk_device_info,
                                            &vkPhysicalDevice) != XR_SUCCESS);
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(vkPhysicalDevice, &props);
+
+    printf("GPU name: %s\n", props.deviceName);
+    printf("Vendor ID: 0x%x\n", props.vendorID);
+    printf("Device ID: 0x%x\n", props.deviceID);
+    printf("Driver version: %u\n", props.driverVersion);
+    printf("API version: %u.%u.%u\n", VK_VERSION_MAJOR(props.apiVersion),
+           VK_VERSION_MINOR(props.apiVersion),
+           VK_VERSION_PATCH(props.apiVersion));
   }
 
   {
@@ -2650,7 +2668,7 @@ extern "C" int engine_main(
                       .material_id = 1,
                       .primitive_type = EDIT_PRIMITIVE_SPHERE,
                       .param0 = 0.25,
-                      .translation = {1.0, 0.5, 1.1},
+                      .translation = {1.0, 0.65, 1.1},
                   },
                   {
                       .is_removal = false,
@@ -2664,7 +2682,7 @@ extern "C" int engine_main(
                       .material_id = 3,
                       .primitive_type = EDIT_PRIMITIVE_SPHERE,
                       .param0 = 0.25,
-                      .translation = {1.0, 1.5, 1.1},
+                      .translation = {1.3, 0.75, 1.1},
                   },
               },
       };
@@ -3110,3 +3128,5 @@ int main() {
 // writing the edit list -- need to proper scene -- done
 // commands: missing step 3 -- done
 // init the material info image with a proper "null" value -- done
+
+// at buffer copy, the buffer is zero

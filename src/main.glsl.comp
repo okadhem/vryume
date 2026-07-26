@@ -182,7 +182,7 @@ vec3 sdf_grad(vec3 p)
 // e1 + e2 is the limit after which we consider that the two sampled values v1 and v2 can not be from the same pre-encoding distance.
 const float zero_distance_4bits = (encoded_distance_resolution / 2.0) + (encoded_distance_resolution_4bits / 2.0); //TODO terrible name
 
-const float zero_distance = 0.001;
+const float zero_distance = 0.0001;
 void main() {
     ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
     uvec3 dispatch_dim = gl_NumWorkGroups * gl_WorkGroupSize;
@@ -253,11 +253,23 @@ void main() {
     {
         ivec3 voxel_id = ivec3(pc.tile_extent_voxels * ray_tip_norm);
         uint material_info = imageLoad(tile_voxel_material, voxel_id).r;
+
+        // works a bit
+        if (material_info == NULL_VOXEL) {
+            vec3 material_sample_point = ray_tip + ray_direction_tile * zero_distance * 10.0;
+            vec3 material_sample_point_norm = material_sample_point / pc.tile_extent;
+            voxel_id = ivec3(pc.tile_extent_voxels * material_sample_point_norm);
+            material_info = imageLoad(tile_voxel_material, voxel_id).r;
+            if (material_info != NULL_VOXEL) {
+                //material_info = 0; // mark voxels that are fixed by this
+            }
+        }
+
         if ((material_info & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
             material_id = material_info & ~HEADER_MASK;
         }
         else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C12_CONFIG) {
-            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
             float sampled_distances[2];
             sampled_distances[0] = decode_distance_4bits(tex.g);
             sampled_distances[1] = decode_distance_4bits(tex.r);
@@ -268,12 +280,16 @@ void main() {
             // it may give better results than the comparing to zero_distance_4bits
             if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
                 material_id = material_ids[0];
+                //material_id = 0;
+                //material_id = material_ids[1]; //DEBUG
             } else if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
                 material_id = material_ids[1];
+                //material_id = 4;
+                //material_id = material_ids[0]; //DEBUG
             }
         }
         else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C13_CONFIG) {
-            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
             float sampled_distances[2];
             sampled_distances[0] = decode_distance_4bits(tex.g);
 
@@ -285,7 +301,7 @@ void main() {
             }
         }
         else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG) {
-            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
             float sampled_distances[2];
             sampled_distances[1] = decode_distance_4bits(tex.r);
 
@@ -297,7 +313,7 @@ void main() {
             }
         }
         else if ((material_info & HEADER_MASK) == THREE_SURFACE_VOXEL_HEADER) {
-            vec2 tex = texture(sdf_packed_image, ray_tip_norm).gr;
+            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
             float sampled_distances[2];
             sampled_distances[0] = decode_distance_4bits(tex.g);
             sampled_distances[1] = decode_distance_4bits(tex.r);
@@ -311,8 +327,7 @@ void main() {
             } else {
                 material_id = material_ids[2];
             }
-        }
-        else {
+        } else {
             //TODO we could reserve a value for when voxel has no material info
             //this should not happen, we should be at the surface of an object
             //TODO report error
@@ -326,7 +341,8 @@ void main() {
     vec3 object_color = vec3(1.0, 0.0, 0.0);
     switch (material_id) {
         case 0:
-        object_color = vec3(0.9, 0.0, 1.0);
+        //object_color = vec3(0.9, 0.0, 1.0);
+        object_color = vec3(0.0, 0.0, 0.0);
         break;
         case 1:
         object_color = vec3(1.0, 1.0, 0.0); // yellow
@@ -336,6 +352,9 @@ void main() {
         break;
         case 3:
         object_color = vec3(0.0, 0.0, 1.0);
+        break;
+        case 4:
+        object_color = vec3(0.0, 1.0, 1.0); // cyan
         break;
         default:
         object_color = vec3(0.0, 1.0, 0.0);

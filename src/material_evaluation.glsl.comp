@@ -474,7 +474,10 @@ void main() {
     //TODO: we should handle multi primitive same material here, i am thinking just union the surfaces of material, but i am still not sure.
 
     ivec3 invocation_voxel_id = ivec3(gl_GlobalInvocationID.xyz);
-    vec3 invocation_position = pc.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
+    //vec3 invocation_position = pc.tile_pos + invocation_voxel_id * inter_sample_distance; // in model space
+
+    //DEBUG(pixel center)
+    vec3 invocation_position = pc.tile_pos + 0.5 * vec3(inter_sample_distance) + invocation_voxel_id * inter_sample_distance; // in model space
 
     // initialize the all the voxel info before doing any work in step 1 or any of the following steps
     // or the algorithm could read garbage data. probably done better with a clear command.
@@ -487,6 +490,7 @@ void main() {
     // however because this check relies on the encoded distance produced by the evaluation, it will have
     // encoding errors, meaning that some voxel will be go through even if they don't hit the object surface
     // the algorithm following this must support that possibility (TODO check that).
+    // TODO: carefull, you are using distances with encoding error
     //{
     //    bool negative_distance = false;
     //    bool positive_distance = false;
@@ -533,11 +537,17 @@ void main() {
 
         float[8] primitive_minus_accumulated;
         for (int i = 0; i < 8; i++) {
-            primitive_minus_accumulated[i] = max(accumulated_removal[i], primitive_voxel_sdf[i]);
+            //primitive_minus_accumulated[i] = max(accumulated_removal[i], primitive_voxel_sdf[i]);
+            float full_distance = max(accumulated_removal[i], primitive_voxel_sdf[i]);
+            primitive_minus_accumulated[i] = decode_distance(u8bit_float_to_norm_float(norm_float_to_8bit_float(encode_distance(full_distance))));
         }
         if (!same_sign(primitive_minus_accumulated)) {
             // we hit a primitive, primitive_minus_accumulated is the sdf.
-            sdfs[primitive_hit] = primitive_minus_accumulated;
+            for (int i = 0; i < 8; i++) {
+                //TODO: make this less
+                //sdfs[primitive_hit][i] = decode_distance(u8bit_float_to_norm_float(norm_float_to_8bit_float(encode_distance(primitive_minus_accumulated[i]))));
+                sdfs[primitive_hit][i] = primitive_minus_accumulated[i];
+            }
             material_ids[primitive_hit] = edit.material_id;
             primitive_hit += 1;
         }

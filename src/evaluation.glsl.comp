@@ -39,7 +39,14 @@ float model_signed_distance(vec3 pos) {
 
 void main() {
     ivec3 invocation_id = ivec3(gl_GlobalInvocationID.xyz);
-    vec3 sample_position = push_constant.tile_pos + invocation_id * inter_sample_distance; // in model space
+    //DEBUG (texel center)
+    vec3 sample_position = push_constant.tile_pos + invocation_id * inter_sample_distance + 0.5 * vec3(inter_sample_distance); // in model space
     float encoded_distance = encode_distance(model_signed_distance(sample_position));
     imageStore(tile_image, invocation_id, vec4(encoded_distance, 0, 0, 0));
+    //if (invocation_id == vec3(773, 372, 535) || invocation_id == vec3(774, 372, 535) || invocation_id == vec3(773, 373, 535) || invocation_id == vec3(774, 373, 535)
+    //        || invocation_id == vec3(773, 372, 536) || invocation_id == vec3(774, 372, 536) || invocation_id == vec3(773, 373, 536) || invocation_id == vec3(774, 373, 536)) {
+    //    imageStore(tile_image, invocation_id, vec4(encoded_distance, 0, 0, 0));
+    //} else {
+    //    imageStore(tile_image, invocation_id, vec4(0.0, 0, 0, 0));
+    //}
 }

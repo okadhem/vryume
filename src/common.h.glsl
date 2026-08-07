@@ -31,6 +31,13 @@ float decode_distance(float sampled_distance) {
     return mix(min_representable_distance, max_representable_distance,
         sampled_distance);
 }
+float norm_float_to_8bit_float(float v) {
+    return round(v * 255.0);
+}
+
+float u8bit_float_to_norm_float(float i) {
+    return i / 255.0;
+}
 
 uint norm_float_to_4bit_uint(float v) {
     return uint(round(v * 15.0));

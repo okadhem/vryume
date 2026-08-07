@@ -1420,11 +1420,11 @@ uint32_t tick() {
 
     printf("eye_pos_world: %f,%f,%f\n", eye_pose_world.translation.x,
            eye_pose_world.translation.y, eye_pose_world.translation.z);
-    // eye_pose_world.translation = vec3(0.859198, 1.173761, 1.817214);
-    // printf("eye_pos_world: %f,%f,%f,%f\n", eye_pose_world.rotation.x,
-    //        eye_pose_world.rotation.y, eye_pose_world.rotation.z,
-    //        eye_pose_world.rotation.w);
-    // eye_pose_world.rotation = quat(-0.96533, 0.17188, 0.1964, -0.00273);
+    // eye_pose_world.translation = vec3(1.589876, 0.808971, 0.859716);
+    printf("eye_pos_world: %f,%f,%f,%f\n", eye_pose_world.rotation.x,
+           eye_pose_world.rotation.y, eye_pose_world.rotation.z,
+           eye_pose_world.rotation.w);
+    // eye_pose_world.rotation = quat(0.070727, -0.018643, 0.996462, 0.040416);
 
     RenderingPushConstant rendering_push_constant = {
         .camera_orientation_world = {eye_pose_world.rotation.x,
@@ -1439,13 +1439,14 @@ uint32_t tick() {
         .tanUp = (float)tan(views[i].fov.angleUp),
         .tanDown = (float)tan(views[i].fov.angleDown),
         .tile_pos = {0.0, 0.0, 0.0},
+        // DEBUG (texel center)
         .tile_extent =
             {
-                (float)((evaluation_state.sdf_tile_image_extent.width - 1) *
+                (float)((evaluation_state.sdf_tile_image_extent.width) *
                         inter_sample_distance),
-                (float)((evaluation_state.sdf_tile_image_extent.height - 1) *
+                (float)((evaluation_state.sdf_tile_image_extent.height) *
                         inter_sample_distance),
-                (float)((evaluation_state.sdf_tile_image_extent.depth - 1) *
+                (float)((evaluation_state.sdf_tile_image_extent.depth) *
                         inter_sample_distance),
             },
         .resolution = {(float)color_swapchains[i].width,

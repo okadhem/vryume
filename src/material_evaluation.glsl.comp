@@ -288,7 +288,8 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf) 
             low_channel = 0;
             high_channel = 1;
         } else {
-            //TODO panic
+            // error
+            imageStore(tile_voxel_material, v, uvec4(INVALID_VOXEL, 0u, 0u, 0u));
         }
     }
 
@@ -318,13 +319,15 @@ void write_two_surface_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf) 
 
                     if (neighbour_material_id != voxel_mapping[low_channel] && neighbour_material_id != voxel_mapping[high_channel]) {
                         // this should not happen v must be neighbouring only the two surfaces we are mapping, not any other.
-                        // TODO report an error
+                        // error
+                        imageStore(tile_voxel_material, v, uvec4(INVALID_VOXEL, 0u, 0u, 0u));
                     }
                 }
             }
     if (!low_channel_surface_done || !high_channel_surface_done) {
         // this should never happen, v must be neighbouring the two surfaces we are mapping
-        //TODO report error
+        // error
+        imageStore(tile_voxel_material, v, uvec4(INVALID_VOXEL, 0u, 0u, 0u));
     }
 }
 
@@ -418,7 +421,8 @@ void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials
                             || (texel & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG
                             || (texel & HEADER_MASK) == THREE_SURFACE_VOXEL_HEADER) {
                         // this should not happen under the geometry assumtion, 3 line intersection are assumed to be far apart enough that we don't see this.
-                        // TODO: mark the error somewhere
+                        // error
+                        imageStore(tile_voxel_material, target_3_surface_voxel, uvec4(INVALID_VOXEL, 0u, 0u, 0u));
                         return;
                     }
 
@@ -462,7 +466,8 @@ void write_third_surface(ivec3 target_3_surface_voxel, uint[3] ordered_materials
                         v_prime_mapping[2] = UNMAPPED_CHANNEL;
                     } else {
                         // this should not happen normally, only if geometry assemutions are not correct, most likely we have two three surface voxels close to each other.
-                        // TODO report error.
+                        // error
+                        imageStore(tile_voxel_material, target_3_surface_voxel, uvec4(INVALID_VOXEL, 0u, 0u, 0u));
                     }
 
                     write_third_surface_inner_loop(v, v_prime_mapping, v_prime_mapping_sdf, v_materials);
@@ -538,8 +543,12 @@ void main() {
         float[8] primitive_minus_accumulated;
         for (int i = 0; i < 8; i++) {
             //primitive_minus_accumulated[i] = max(accumulated_removal[i], primitive_voxel_sdf[i]);
-            float full_distance = max(accumulated_removal[i], primitive_voxel_sdf[i]);
-            primitive_minus_accumulated[i] = decode_distance(u8bit_float_to_norm_float(norm_float_to_8bit_float(encode_distance(full_distance))));
+            //float full_distance = max(accumulated_removal[i], primitive_voxel_sdf[i]);
+            //DEBUG(temporary disabling the substraction part)
+            float full_distance = primitive_voxel_sdf[i];
+            //primitive_minus_accumulated[i] = decode_distance(u8bit_float_to_norm_float(norm_float_to_8bit_float(encode_distance(full_distance))));
+            //DEBUG(full precision corners)
+            primitive_minus_accumulated[i] = full_distance;
         }
         if (!same_sign(primitive_minus_accumulated)) {
             // we hit a primitive, primitive_minus_accumulated is the sdf.
@@ -557,9 +566,12 @@ void main() {
     }
 
     if (primitive_hit > 3) {
-        // should not happen under geometry assumptions
         // TODO handle multi primitive same material
-        // TODO report error
+
+        // should not happen under geometry assumptions
+        // error
+        imageStore(tile_voxel_material, invocation_voxel_id, uvec4(INVALID_VOXEL, 0u, 0u, 0u));
+        return;
     }
     switch (pc.step) {
         case STEP_1_SURFACE:

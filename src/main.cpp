@@ -650,7 +650,8 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
                     evaluation_state.sdf_tile_image_extent.height *
                     evaluation_state.sdf_tile_image_extent.depth,
             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT, // needed for the clear
             .memoryTypeIndex =
                 host_visible_memory_type_index, // only GPU will use this, yet
                                                 // we do this to get a page in
@@ -1420,11 +1421,14 @@ uint32_t tick() {
 
     printf("eye_pos_world: %f,%f,%f\n", eye_pose_world.translation.x,
            eye_pose_world.translation.y, eye_pose_world.translation.z);
-    // eye_pose_world.translation = vec3(1.589876, 0.808971, 0.859716);
+    // eye_pose_world.translation = vec3(1.3654, 1.10464, 0.97066);
     printf("eye_pos_world: %f,%f,%f,%f\n", eye_pose_world.rotation.x,
            eye_pose_world.rotation.y, eye_pose_world.rotation.z,
            eye_pose_world.rotation.w);
-    // eye_pose_world.rotation = quat(0.070727, -0.018643, 0.996462, 0.040416);
+    // eye_pose_world.rotation.x = -0.02703;
+    // eye_pose_world.rotation.y = 0.94046;
+    // eye_pose_world.rotation.z = 0.23587;
+    // eye_pose_world.rotation.w = 0.24323;
 
     RenderingPushConstant rendering_push_constant = {
         .camera_orientation_world = {eye_pose_world.rotation.x,
@@ -2372,11 +2376,19 @@ extern "C" int engine_main(
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         },
+        {
+            .binding = 3,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = NULL,
+        },
+
     };
 
     VkDescriptorSetLayoutCreateInfo rendering_set_layout_create_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 3,
+        .bindingCount = 4,
         .pBindings = rendering_descriptor_set_bindings};
 
     vkCreateDescriptorSetLayout(vkDevice, &rendering_set_layout_create_info,
@@ -2670,6 +2682,7 @@ extern "C" int engine_main(
                       .primitive_type = EDIT_PRIMITIVE_SPHERE,
                       .param0 = 0.25,
                       .translation = {1.0, 0.65, 1.1},
+                      .rotation = {0, 0, 0, 1}, // unit quat
                   },
                   {
                       .is_removal = false,
@@ -2677,6 +2690,7 @@ extern "C" int engine_main(
                       .primitive_type = EDIT_PRIMITIVE_SPHERE,
                       .param0 = 0.25,
                       .translation = {1.0, 1.0, 1.1},
+                      .rotation = {0, 0, 0, 1}, // unit quat
                   },
                   {
                       .is_removal = false,
@@ -2684,6 +2698,7 @@ extern "C" int engine_main(
                       .primitive_type = EDIT_PRIMITIVE_SPHERE,
                       .param0 = 0.25,
                       .translation = {1.3, 0.75, 1.1},
+                      .rotation = {0, 0, 0, 1}, // unit quat
                   },
               },
       };
@@ -2753,6 +2768,11 @@ extern "C" int engine_main(
           .imageView = evaluation_state.material_sdf_image_view,
           .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
       };
+      VkDescriptorBufferInfo buffer_info = {
+          .buffer = edit_list_buffer,
+          .offset = 0,
+          .range = VK_WHOLE_SIZE,
+      };
       VkWriteDescriptorSet writes[] = {
           {
               .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -2781,9 +2801,19 @@ extern "C" int engine_main(
               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
               .pImageInfo = &material_sdf_image_info,
           },
+          {
+              // added for debug purposes
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = rendering_descriptor_set,
+              .dstBinding = 3,
+              .dstArrayElement = 0,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+              .pBufferInfo = &buffer_info,
+          },
       };
 
-      vkUpdateDescriptorSets(vkDevice, 3, writes, 0, nullptr);
+      vkUpdateDescriptorSets(vkDevice, 4, writes, 0, nullptr);
     }
   }
 
@@ -2873,6 +2903,37 @@ extern "C" int engine_main(
 
     // material evaluation commands
     {
+
+      // initialize the buffer, not strictly necessary, but it nice when
+      // debugging written values.
+      {
+        vkCmdFillBuffer(evaluation_commands,
+                        evaluation_state.material_sdf_packed, 0, VK_WHOLE_SIZE,
+                        0xFFFFFFFF);
+
+        VkBufferMemoryBarrier2 barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask =
+                VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+
+            .buffer = evaluation_state.material_sdf_packed,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+
+        VkDependencyInfo dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier,
+        };
+
+        vkCmdPipelineBarrier2(evaluation_commands, &dependency);
+      }
+
       uint32 texture_voxel_width =
           evaluation_state.sdf_tile_image_extent.width - 1;
       uint32 texture_voxel_height =

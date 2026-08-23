@@ -31,6 +31,7 @@ const uint THREE_SURFACE_VOXEL_HEADER = 0xC0u; //0b11000000u;
 
 //voxel value for the uninitialized state of a voxel.
 const uint NULL_VOXEL = 0xA0; //0b10100000u
+const uint INVALID_VOXEL = 0xA1; //0b10100001u
 
 // converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.
 uint coord_to_neighbour_id(ivec3 c) {
@@ -73,7 +74,8 @@ uint[2] read_2_surface_voxel_material_id(ivec3 v) {
                 }
             }
     // this should not happen, we must find two material id in the neighbours.
-    // TODO report an error.
+    // error
+    return uint[2](low_channel_material_id, 0);
 }
 
 // returns material ids of voxel v, in ascending channel order.

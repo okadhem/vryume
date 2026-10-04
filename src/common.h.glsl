@@ -98,3 +98,7 @@ float evaluate_primitive(Edit edit, vec3 pos) {
     // TODO panic
     return 0;
 }
+
+uint default_material_info(uint material_id) {
+    //TODO
+}

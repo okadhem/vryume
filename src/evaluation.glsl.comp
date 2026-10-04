@@ -12,26 +12,38 @@ layout(
 set = 0,
 binding = 0,
 r8
-) uniform writeonly image3D tile_image;
+) uniform writeonly image3D total_sdf;
 
 layout(set = 0, binding = 1, std140) uniform EditsUniformBuffer {
     uint edit_list_size;
     Edit edit_list[4];
 };
 
+layout(
+set = 0,
+binding = 2,
+r8ui
+) uniform uimage3D samples_material_info;
+
 #include "common.h.glsl"
 
 //pos in model space
 //returns distance in meters
-float model_signed_distance(vec3 pos) {
+float model_signed_distance(vec3 pos, out uint material_id) {
     float accumulated_distance = MAX_FLOAT;
     for (uint edit_id = 0; edit_id < edit_list_size; edit_id++) {
         Edit edit = edit_list[edit_id];
         float primtive_distance = evaluate_primitive(edit, pos);
         if (edit.is_removal) {
-            accumulated_distance = max(accumulated_distance, -primtive_distance);
+            if (-primtive_distance > accumulated_distance) {
+                accumulated_distance = -primtive_distance;
+                material_id = edit.material_id;
+            }
         } else {
-            accumulated_distance = min(accumulated_distance, primtive_distance);
+            if (primtive_distance < accumulated_distance) {
+                accumulated_distance = primtive_distance;
+                material_id = edit.material_id;
+            }
         }
     }
     return accumulated_distance;
@@ -41,12 +53,8 @@ void main() {
     ivec3 invocation_id = ivec3(gl_GlobalInvocationID.xyz);
     //DEBUG (texel center)
     vec3 sample_position = push_constant.tile_pos + invocation_id * inter_sample_distance + 0.5 * vec3(inter_sample_distance); // in model space
-    float encoded_distance = encode_distance(model_signed_distance(sample_position));
-    imageStore(tile_image, invocation_id, vec4(encoded_distance, 0, 0, 0));
-    //if (invocation_id == vec3(773, 372, 535) || invocation_id == vec3(774, 372, 535) || invocation_id == vec3(773, 373, 535) || invocation_id == vec3(774, 373, 535)
-    //        || invocation_id == vec3(773, 372, 536) || invocation_id == vec3(774, 372, 536) || invocation_id == vec3(773, 373, 536) || invocation_id == vec3(774, 373, 536)) {
-    //    imageStore(tile_image, invocation_id, vec4(encoded_distance, 0, 0, 0));
-    //} else {
-    //    imageStore(tile_image, invocation_id, vec4(0.0, 0, 0, 0));
-    //}
+    uint material_id;
+    float encoded_distance = encode_distance(model_signed_distance(sample_position, material_id));
+    imageStore(total_sdf, invocation_id, vec4(encoded_distance, 0, 0, 0));
+    imageStore(samples_material_info, invocation_id, uvec4(default_material_info(material_id), 0, 0, 0));
 }

@@ -36,9 +36,10 @@ layout(push_constant) uniform PushConstant {
 
 layout(
 set = 0,
-binding = 1,
-r8ui
-) uniform uimage3D tile_voxel_material;
+binding = 1
+) buffer MaterialInfoBuffer {
+    coherent uint material_info[];
+};
 
 layout(
 set = 0,
@@ -105,7 +106,7 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf_mapping) 
 
         // we use atomic writes that require the location to be 4 byte aligned
         uint atomic_word_index = sample_buffer_index / 4;
-        uint texel_offset_in_atomic_word = sample_buffer_index % 4;
+        uint texel_offset_in_atomic_word = sample_buffer_index % 4; // in bytes
 
         // CAS loop
         for (; ; ) {
@@ -133,6 +134,58 @@ void write_sdf_mapping(ivec3 v, uint[3] voxel_mapping, float[3][8] sdf_mapping) 
             }
         }
     }
+}
+// material_id_mapping is a mapping from channel to material_id
+void write_material_id_mapping(ivec3 voxel_id, uint[3] material_id_mapping) {
+    uint width = pc.voxel_texture_width + 1;
+    uint height = pc.voxel_texture_height + 1;
+
+    uint[8] offsets = uint[](
+            0, // (0,0,0)
+            1, // (1,0,0)
+            width, // (0,1,0)
+            width + 1, // (1,1,0)
+            width * height, // (0,0,1)
+            width * height + 1, // (1,0,1)
+            width * height + width, // (0,1,1)
+            width * height + width + 1 // (1,1,1)
+        );
+    uint zero_offset_index = voxel_id.x + voxel_id.y * width + voxel_id.z * width * height; // index in texels
+
+    uint[8] current_value;
+    for (int i = 0; i < 8; i++) {
+        uint sample_buffer_index = zero_offset_index + offsets[i]; // in texels
+
+        // we use atomic writes that require the location to be 4 byte aligned
+        uint atomic_word_index = sample_buffer_index / 4;
+        uint texel_offset_in_atomic_word = sample_buffer_index % 4; // in bytes
+
+        // CAS loop
+        for (; ; ) {
+            uint current_value = atomicAdd(material_info[atomic_word_index], 0);
+            uint new_value = current_value;
+
+            uint current_texel_value = (current_value >> (texel_offset_in_atomic_word * 8)) & 0xFFu;
+            uint new_material_info = 0;
+            for (int channel_index = 0; channel_index < 3; channel_index++) {
+                if (material_id_from_info(current_texl_value) == write_material_id_mapping[channel_index]) {
+                    new_material_info = make_material_info(write_material_id_mapping[channel_index], channel_index);
+                    break;
+                }
+            }
+            //TODO what if we don't find the material_id ?
+
+            uint shift = 8 * texel_offset_in_atomic_word;
+            uint mask = 0xFF << shift;
+            new_value = (new_value & ~mask) | (new_material_info << shift);
+
+            uint value_before_write = atomicCompSwap(material_info[atomic_word_index], current_value, new_value);
+            if (value_before_write == current_value) {
+                break;
+            }
+        }
+    }
+    //TODO
 }
 
 // calculate the sdf values in a specific order
@@ -474,7 +527,19 @@ uint[3] voxel_material_ids(ivec3 voxel_id, out int size) {
     //TODO
 }
 
-void process_default_two_surface_voxel(ivec3 voxel_id, uint[3] ordered_materials, float[3][8] ordered_sdfs) {}
+void process_default_two_surface_voxel(ivec3 voxel_id, uint[3] ordered_materials, float[3][8] ordered_sdfs) {
+    int materials_ordered_size;
+    uint materials_ordered[3] = voxel_material_ids(voxel_id, materials_ordered_size);
+
+    //TODO explain somewhere why the order is important
+    uint[3] material_id_mapping = {
+            materials_ordered[0],
+            materials_ordered[1],
+            UNMAPPED_CHANNEL
+        };
+
+    write_sdf_mapping(voxel_id, material_id_mapping, ordered_sdfs);
+}
 
 // inner loop for the main write_third_surface function, i needed to be able to break from the nested 3 loops
 void process_non_default_voxel_inner_loop(ivec3 v, uint v_prime_mapping[3], float v_prime_mapping_sdf[3][8], uint v_materials_ordered[2] // material ids sorted in ascending order
@@ -496,7 +561,8 @@ void process_non_default_voxel_inner_loop(ivec3 v, uint v_prime_mapping[3], floa
                 }
                 if (neighbour_materials_ordered_size == 3) {
                     // TODO check that its our 3 surfaces and assert otherwise
-                    // TODO flip v to its prime
+                    write_material_id_mapping(v, v_prime_mapping);
+                    write_sdf_mapping(v, v_prime_mapping, v_prime_mapping_sdf);
                     return;
                 }
                 if (neighbour_materials_ordered_size > 3) {
@@ -511,13 +577,21 @@ void process_non_default_voxel_inner_loop(ivec3 v, uint v_prime_mapping[3], floa
                     continue;
                 }
 
-                // TODO flip
+                write_material_id_mapping(v, v_prime_mapping);
+                write_sdf_mapping(v, v_prime_mapping, v_prime_mapping_sdf);
                 return;
             }
 }
 
 void process_non_default_voxel(ivec3 target_3_surface_voxel, uint[3] ordered_materials, float[3][8] ordered_sdfs) {
-    //TODO write the mapping for the three surface voxel
+    {
+        uint[3] materials_mapping = uint[3](ordered_materials[0], ordered_materials[2], ordered_materials[1]);
+        float[3][8] sdf_mapping = float[3][8](ordered_sdfs[0], ordered_sdfs[2], ordered_sdfs[1]);
+
+        write_sdf_mapping(target_3_surface_voxel, materials_mapping, sdf_mapping);
+        write_material_id_mapping(target_3_surface_voxel, ordered_materials);
+    }
+
     for (int r = 0; r <= MAX_RADIUS; r++)
     {
         for (int z = -r; z <= r; z++)

@@ -10,6 +10,11 @@ const uint CHANNEL_1_MAPPING_HEADER = 0x40u; //0b01000000
 const uint CHANNEL_2_MAPPING_HEADER = 0x80u; //0b10000000
 const uint CHANNEL_3_MAPPING_HEADER = 0x60u; //0b11000000
 
+// we represent a voxel's channel to surface mapping with a 3 element uint array, where element 0 is
+// the surface mapped to the first channel, etc ..
+// if a channel is not mapped, we represent it with UNMAPPED_CHANNEL.
+const uint UNMAPPED_CHANNEL = UINT_MAX;
+
 uint make_material_info(uint material_id, uint channel_index) {
     switch (channel_index) {
         case 0:
@@ -29,6 +34,10 @@ uint make_material_info(uint material_id, uint channel_index) {
 
 uint material_id_from_info(uint material_info) {
     return material_info & (~HEADER_MASK);
+}
+
+uint material_mapping_from_info(uint material_info) {
+    return material_info & HEADER_MASK;
 }
 
 // converts between coordinates centred around a voxel, ranging from -1 to 1 and linearized id.

@@ -27,6 +27,8 @@ r8ui
 
 #include "common.h.glsl"
 
+#include "material_evaluation.h.glsl"
+
 //pos in model space
 //returns distance in meters
 float model_signed_distance(vec3 pos, out uint material_id) {
@@ -56,5 +58,5 @@ void main() {
     uint material_id;
     float encoded_distance = encode_distance(model_signed_distance(sample_position, material_id));
     imageStore(total_sdf, invocation_id, vec4(encoded_distance, 0, 0, 0));
-    imageStore(samples_material_info, invocation_id, uvec4(default_material_info(material_id), 0, 0, 0));
+    imageStore(samples_material_info, invocation_id, uvec4(make_material_info(material_id, DEFAULT_MAPPING_HEADER), 0, 0, 0));
 }

@@ -1,26 +1,17 @@
 #version 450
 // this shader runs per voxel, we identify a voxel with its low x,y,z corner.
 
-// [NOTE: Wrong sdfs after STEP_2_SURFACE]
-// At the end of STEP_2_SURFACE, the voxels close to the 3 surface voxels have wrong tile_voxel_material values, but also garbage sdf values
-// because of the concurrent incompatible writes to sample points, precisely, any two neigbouring voxels that belong to different lines (not same material_id pair)
-// will have garbage sdf values, therefore, STEP_3_SURFACE must not rely on this sdf values and must override them with the correct ones.
-// said another way, neighbouring voxels that don't have equal mappings will have wrong sdf values.
-
 // TODO this layout dimensions are bad, they are too big, but its a hack as it divides the total dispatch_dim
 // size of 999 voxel, we need to pick a good size and do bound checks like normal people
 layout(local_size_x = 9, local_size_y = 9, local_size_z = 9) in;
 
 #include "types.h.glsl"
 
-const int STEP_1_SURFACE = 0; // when this step is done, all one surface voxels are properly encoded.
+const int NON_DEFAULT_STEP = 1; // depends on evaluation shader results (material_info_buf), all samples should have a material_id set.
+// when this step is done, all voxels with non default mapping are encoded, sdfs and material_id mapping are written.
 
-const int STEP_2_SURFACE = 1; // when this step is done, *most* of two surface voxels are properly encoded, precisely, all two surface voxels that
-// are away from a three voxel surface, (the line portion away from any intersection). other two surface voxel are encoded with *wrong* data
-// namely wrong configuration, and invalid sdf values, it is the job of STEP_3_SURFACE to fix that.
-
-const int STEP_3_SURFACE = 2; // when this step is done, all three surface voxels are encoded properly, as well as all the two surface voxels close
-// to three surface voxels, left in a wrong state by preious step.
+const int DEFAULT_TWO_SURFACE_STEP = 2; // depends on results from NON_DEFAULT_STEP
+// when this step is done, all two surface voxels with default mapping are encoded, sdfs are written.
 
 layout(set = 0, binding = 0, std140) uniform EditsUniformBuffer {
     uint edit_list_size;
@@ -38,7 +29,7 @@ layout(
 set = 0,
 binding = 1
 ) buffer MaterialInfoBuffer {
-    coherent uint material_info[];
+    coherent uint material_info_buf[];
 };
 
 layout(
@@ -51,16 +42,11 @@ binding = 2
 layout(
 set = 0,
 binding = 3
-) uniform sampler3D tile_image;
+) uniform sampler3D tile_image; // unused, why keep it here ?
 
 #include "common.h.glsl"
 
 #include "material_evaluation.h.glsl"
-
-// we represent a voxel, channel to surface mapping with a 3 element uint array, where element 0 is
-// the surface mapped to the first channel, etc ..
-// if a channel is not mapped, we represent it with UNMAPPED_CHANNEL.
-const uint UNMAPPED_CHANNEL = UINT_MAX;
 
 bool are_mappings_compatible(uint[3] mapping1, uint[3] mapping2) {
     for (int i = 0; i < 3; i++) {
@@ -162,12 +148,12 @@ void write_material_id_mapping(ivec3 voxel_id, uint[3] material_id_mapping) {
 
         // CAS loop
         for (; ; ) {
-            uint current_value = atomicAdd(material_info[atomic_word_index], 0);
+            uint current_value = atomicAdd(material_info_buf[atomic_word_index], 0);
             uint current_texel_value = (current_value >> (texel_offset_in_atomic_word * 8)) & 0xFFu;
 
             uint new_material_info = UINT_MAX;
             for (int channel_index = 0; channel_index < 3; channel_index++) {
-                if (material_id_from_info(current_texl_value) == material_id_mapping[channel_index]) {
+                if (material_id_from_info(current_texel_value) == material_id_mapping[channel_index]) {
                     new_material_info = make_material_info(material_id_mapping[channel_index], channel_index);
                     break;
                 }
@@ -181,7 +167,7 @@ void write_material_id_mapping(ivec3 voxel_id, uint[3] material_id_mapping) {
             uint mask = 0xFF << shift;
             uint new_value = (current_value & ~mask) | (new_material_info << shift);
 
-            uint value_before_write = atomicCompSwap(material_info[atomic_word_index], current_value, new_value);
+            uint value_before_write = atomicCompSwap(material_info_buf[atomic_word_index], current_value, new_value);
             if (value_before_write == current_value) {
                 break;
             }
@@ -224,26 +210,23 @@ bool same_sign(float fs[8]) {
 // agree with its neighbours on the mapping of all the channels: if the neighbour voxel uses the channel, it must
 // map it to the same surface we are mapping it to. (the reason is shared sample point have to agree on the same distance value).
 
+// we will have two mappings modes, at and close to the intersection voxel P, done by NON_DEFAULT_STEP and far from
+// any intersection point done by DEFAULT_TWO_SURFACE_STEP (and by the evaluation shader initial encoding).
+// default mapped voxels are such that we can deduce the mapping just by knowing that the voxel is default mapped and the material_ids of the voxel.
+// This is the case for:
+// - voxels with one material_id, in that case the only surface is available in the total sdf.
+// - voxels with two material_id, in that case channel 1 holds the smaller material_id surface, channel 2 holdes the bigger material_id surface.
+//
+// For non default mappings:
+//
 // Three surfaces meet in a voxel, forming three lines meeting in a point.
 // Each surface has an id (material_id), we sort the ids and get the following triplet (S1,S2,S3)
 // each line splits two surfaces, we sort their ids and get the following possibilites
-// L12: S1,S2
-// L23: S2,S3
-// L13: S1,S3
+// S1,S2 (we refer to the default voxel mapping of these two surfaces as L12)
+// S2,S3 (we refer to the default voxel mapping of these two surfaces as L23)
+// S1,S3 (we refer to the default voxel mapping of these two surfaces as L13)
 // we call the intersection voxel P.
 //
-// Each line voxels are initially (at the end of STEP_2_SURFACE) encoded with the channel configuration C12 and lower material_id surface
-// on channel 1, basically one of L12, L23 and L13 even though this numbers don't make sense at STEP_2_SURFACE since we only see
-// two surfaces there not three.
-
-// Rule:
-// - L12/L23/L13 must never be neighbours (no overlapping vertices), all of them use the same two channels
-// for different surfaces and thus voxels should not be touching.
-// - L12/L23/L13 must not be neighbours to P. technically L13 and P are compatible, but L12 and L23
-// are not, and we want an algorithm which will have deterministic results even if we shuffle
-// material_id assignment. this is important as the choice of material_id will be probably done prior to any
-// topology considerations.
-
 // we prepare a version of each of the line encoding called L12' L23' L13', that has two characteristics:
 // - L12' is compatible with L12. (resp. L23' and L13')
 // - L12' L23' L13' are all compatible with each other and compatible with the 3 surface voxel where they all meet.
@@ -254,18 +237,20 @@ bool same_sign(float fs[8]) {
 // L23': channel 2 => S3, channel 3 => S2
 // L13': channel 1 => S1, channel 2 => S3
 
-// we add an extra rule:
+// Rules:
+// - L12/L23/L13 must never be neighbours (no overlapping vertices), all of them use default mapping (they use channel 1 and 2)
+// for different surfaces and thus voxels should not be touching.
+// - L12/L23/L13 must not be neighbours to P. technically L13 and P are compatible, but L12 and L23
+// are not, and we want an algorithm which will have deterministic results even if we shuffle
+// material_id assignment. this is important as the choice of material_id will be probably done prior to any
+// topology considerations.
 // - L*' should not be neighbouring any L* voxel other than the one naturally associated to it,
 // so L12 with L12' is fine but L12 with L13' or L23' is not. technically speaking not all such
 // combinations are uncompatible, however for the same reason as above, we refrain from relying on that
 // because it would make the algorithm decision depend on an arbitrary material_id assignment.
-// a consequence of this is that we will automatically handle the issue expressed in [NOTE: Wrong sdfs after STEP_2_SURFACE]:
-// since after STEP_3_SURFACE, we will only allow strict compatibility between neighbouring 2 surface voxels, we are sure that any voxel pair
-// is either made of equal mappings, or prime version of one another, which originated from equal mappings in STEP_2_SURFACE
-// thus these mappings have correct sdf values.
 
 // The general idea of the algorithm is simply, look at the neighbouring (2surface) voxels to P, up to max radius.
-// if the voxel v has incompatible neighbours, meaning it is close to either P, other L* voxels
+// if the voxel v has neighbours tha violate the rules above, meaning it is close to either P, other L* voxels
 // or to a L*' that is not its compatible prime form, we switch v to its compatible prime form (L12', L13' or L13').
 
 // TODO: we need to find a way to assert if we write a sample with different surfaces distance values.
@@ -302,26 +287,78 @@ void sort_asc_material_id(inout uint material_id[3], inout float sdfs[3][8])
     }
 }
 
-// we will call cannocial voxel mappings the kind of mappings found at the end of STEP_2_SURFACE (L*) and STEP_3_SURFACE L* and L'*
-// so mapping in C12 with ordered material ids and their corresponding prime forms.
-// given 2 such voxels, we define the strict compatibility realtion as following
-// two voxels mappings are strictly compatible if they are equal.
-// two voxels mappings are strictly compatible if one is a STEP_2_SURFACE 2 voxel mapping and the other its prime form.
-// strict compatibility implies compatibility.
-// in order to test that two cannocial 2 surface voxel are strictly compatible, we can simply check that they map to the same
-// surfaces.
+uint[3] read_material_ids_ordered(ivec3 voxel_id, out int size) {
+    //NOTE: i think we can probably do this without the atomics
 
-// sort in assending order.
-void sort2(uint[2] a) {
-    if (a[0] > a[1]) {
-        uint t = a[0];
-        a[0] = a[1];
-        a[1] = t;
+    // sdf_texels_packed holds sample points, dimensions are voxels + 1.
+    uint width = pc.voxel_texture_width + 1;
+    uint height = pc.voxel_texture_height + 1;
+
+    uint[8] offsets = uint[](
+            0, // (0,0,0)
+            1, // (1,0,0)
+            width, // (0,1,0)
+            width + 1, // (1,1,0)
+            width * height, // (0,0,1)
+            width * height + 1, // (1,0,1)
+            width * height + width, // (0,1,1)
+            width * height + width + 1 // (1,1,1)
+        );
+    uint zero_offset_index = voxel_id.x + voxel_id.y * width + voxel_id.z * width * height; // index in texels
+
+    uint deduplicated_materials[8];
+    int next_deduplicated_materials = 0;
+    for (int offset_id = 0; offset_id < 8; offset_id++) {
+        uint sample_buffer_index = zero_offset_index + offsets[offset_id]; // in texels
+
+        uint atomic_word_index = sample_buffer_index / 4;
+        uint texel_offset_in_atomic_word = sample_buffer_index % 4; // in bytes
+        uint atomic_word_value = atomicAdd(material_info_buf[atomic_word_index], 0);
+        uint texel_value = (atomic_word_value >> (texel_offset_in_atomic_word * 8)) & 0xFFu;
+        uint material_id = material_id_from_info(texel_value);
+
+        bool material_already_encountred = false;
+        for (int i = 0; i < next_deduplicated_materials; i++) {
+            if (deduplicated_materials[i] == material_id) {
+                material_already_encountred = true;
+            }
+        }
+        if (!material_already_encountred) {
+            deduplicated_materials[next_deduplicated_materials] = material_id;
+            next_deduplicated_materials += 1;
+        }
+    }
+    if (next_deduplicated_materials == 1) {
+        size = next_deduplicated_materials;
+        return uint[3](deduplicated_materials[0], UINT_MAX, UINT_MAX);
+    }
+    if (next_deduplicated_materials == 2) {
+        size = next_deduplicated_materials;
+        uint result[3] = uint[](deduplicated_materials[0], deduplicated_materials[1], UINT_MAX);
+        sort3(result);
+        return result;
+    }
+    if (next_deduplicated_materials == 3) {
+        size = next_deduplicated_materials;
+        uint result[3] = uint[](deduplicated_materials[0], deduplicated_materials[1], deduplicated_materials[2]);
+        sort3(result);
+        return result;
+    }
+    if (next_deduplicated_materials > 3) {
+        //TODO: unhandled for now, we just ignore some of them
+        size = 3;
+        uint result[3] = uint[](deduplicated_materials[0], deduplicated_materials[1], deduplicated_materials[2]);
+        sort3(result);
+        return result;
     }
 }
 
-uint[3] voxel_material_ids_ordered(ivec3 voxel_id, out int size) {
-    //NOTE: i think we can probably do this without the atomics
+// This function relies on data in material_info_buf, NON_DEFAULT_STEP must alredy be done.
+bool is_default_mapping(ivec3 voxel_id) {
+    // sdf_texels_packed holds sample points, dimensions are voxels + 1.
+    uint width = pc.voxel_texture_width + 1;
+    uint height = pc.voxel_texture_height + 1;
+
     uint[8] offsets = uint[](
             0, // (0,0,0)
             1, // (1,0,0)
@@ -337,19 +374,21 @@ uint[3] voxel_material_ids_ordered(ivec3 voxel_id, out int size) {
     for (int i = 0; i < 8; i++) {
         uint sample_buffer_index = zero_offset_index + offsets[i]; // in texels
 
-        uint atomic_word_index = sample_buffer_index / 4;
-        uint texel_offset_in_atomic_word = sample_buffer_index % 4; // in bytes
+        uint buffer_word_index = sample_buffer_index / 4;
+        uint texel_offset_in_buffer_word = sample_buffer_index % 4; // in bytes
 
-        uint atomic_word_value = atomicAdd(material_info[atomic_word_index], 0);
-        uint texel_value = (atomic_word_value >> (texel_offset_in_atomic_word * 8)) & 0xFFu;
-        uint material_id = material_id_from_info(texel_value);
-        //TODO: continue this
+        uint buffer_word = material_info_buf[buffer_word_index];
+        uint material_info = (buffer_word >> (texel_offset_in_buffer_word * 8)) & 0xFFu;
+        if (material_mapping_from_info(material_info) == DEFAULT_MAPPING_HEADER) {
+            return true;
+        }
     }
+    return false;
 }
 
 void process_default_two_surface_voxel(ivec3 voxel_id, uint[3] ordered_materials, float[3][8] ordered_sdfs) {
     int materials_ordered_size;
-    uint materials_ordered[3] = voxel_material_ids_ordered(voxel_id, materials_ordered_size);
+    uint materials_ordered[3] = read_material_ids_ordered(voxel_id, materials_ordered_size);
 
     //TODO explain somewhere why the order is important
     uint[3] material_id_mapping = {
@@ -362,7 +401,7 @@ void process_default_two_surface_voxel(ivec3 voxel_id, uint[3] ordered_materials
 }
 
 // inner loop for the main write_third_surface function, i needed to be able to break from the nested 3 loops
-void process_non_default_voxel_inner_loop(ivec3 v, uint v_prime_mapping[3], float v_prime_mapping_sdf[3][8], uint v_materials_ordered[2] // material ids sorted in ascending order
+void process_non_default_voxel_inner_loop(ivec3 v, uint v_prime_mapping[3], float v_prime_mapping_sdf[3][8], uint v_materials_ordered[3] // material ids sorted in ascending order
 ) {
     for (int k = -1; k <= 1; ++k)
         for (int j = -1; j <= 1; ++j)
@@ -374,7 +413,7 @@ void process_non_default_voxel_inner_loop(ivec3 v, uint v_prime_mapping[3], floa
                     continue;
 
                 int neighbour_materials_ordered_size;
-                uint neighbour_materials_ordered = voxel_material_ids_ordered(v + offset, neighbour_materials_size);
+                uint neighbour_materials_ordered[3] = read_material_ids_ordered(v + offset, neighbour_materials_ordered_size);
 
                 if (neighbour_materials_ordered_size == 1) {
                     continue;
@@ -390,10 +429,11 @@ void process_non_default_voxel_inner_loop(ivec3 v, uint v_prime_mapping[3], floa
                     return;
                 }
                 // neighbour_materials_ordered_size == 2
-                if (neighbour_materials_ordered[0] == v_materials_ordered[0] && neighbour_materials[1] == v_materials[1]) {
-                    // TODO not sure about the explainaition
+                if (neighbour_materials_ordered[0] == v_materials_ordered[0] && neighbour_materials_ordered[1] == v_materials_ordered[1]) {
                     // both us and this neighbour are cannocial voxels, with same material ids, therefore we are
                     // strictly compatible.
+                    // if we assume that we can far enough from any other 3 voxel with different surfaces
+                    // neighbour can only be L* or L*', since we have the same material_ids, we are compatible
                     continue;
                 }
 
@@ -427,7 +467,7 @@ void process_non_default_voxel(ivec3 target_3_surface_voxel, uint[3] ordered_mat
 
                     // TODO: bounds check, i think we might not need code here because we are not at texture boundry, but we need to confirm this
                     int v_materials_ordered_size;
-                    uint v_materials_ordered[3] = voxel_material_ids_ordered(v, v_materials_size);
+                    uint v_materials_ordered[3] = read_material_ids_ordered(v, v_materials_ordered_size);
 
                     if (v_materials_ordered_size == 1) {
                         continue;
@@ -436,7 +476,7 @@ void process_non_default_voxel(ivec3 target_3_surface_voxel, uint[3] ordered_mat
                         //TODO: check that we have materials as this guy
                         continue;
                     }
-                    if (v_materials_ordered > 3) {
+                    if (v_materials_ordered_size > 3) {
                         //TODO: not supported for now
                         continue;
                     }
@@ -446,7 +486,7 @@ void process_non_default_voxel(ivec3 target_3_surface_voxel, uint[3] ordered_mat
                     uint[3] v_prime_mapping;
                     float[3][8] v_prime_mapping_sdf;
                     {
-                        if (v_materials_ordered[0] == ordered_materials[0] && v_materials[1] == ordered_materials[1]) {
+                        if (v_materials_ordered[0] == ordered_materials[0] && v_materials_ordered[1] == ordered_materials[1]) {
                             // L12
                             v_prime_mapping[0] = ordered_materials[0];
                             v_prime_mapping_sdf[0] = ordered_sdfs[0];
@@ -455,7 +495,7 @@ void process_non_default_voxel(ivec3 target_3_surface_voxel, uint[3] ordered_mat
 
                             v_prime_mapping[2] = ordered_materials[1];
                             v_prime_mapping_sdf[2] = ordered_sdfs[1];
-                        } else if (v_materials_ordered[0] == ordered_materials[1] && v_materials[1] == ordered_materials[2]) {
+                        } else if (v_materials_ordered[0] == ordered_materials[1] && v_materials_ordered[1] == ordered_materials[2]) {
                             // L23
                             v_prime_mapping[0] = UNMAPPED_CHANNEL;
 
@@ -465,7 +505,7 @@ void process_non_default_voxel(ivec3 target_3_surface_voxel, uint[3] ordered_mat
                             v_prime_mapping[2] = ordered_materials[1];
                             v_prime_mapping_sdf[2] = ordered_sdfs[1];
                         }
-                        else if (v_materials_ordered[0] == ordered_materials[0] && v_materials[1] == ordered_materials[2]) {
+                        else if (v_materials_ordered[0] == ordered_materials[0] && v_materials_ordered[1] == ordered_materials[2]) {
                             // L13
                             v_prime_mapping[0] = ordered_materials[0];
                             v_prime_mapping_sdf[0] = ordered_sdfs[0];
@@ -493,7 +533,7 @@ void main() {
     vec3 invocation_position = pc.tile_pos + 0.5 * vec3(inter_sample_distance) + invocation_voxel_id * inter_sample_distance; // in model space
 
     int material_ids_size;
-    uint material_ids[3] = voxel_material_ids_ordered(invocation_voxel_id, material_ids_size);
+    uint material_ids[3] = read_material_ids_ordered(invocation_voxel_id, material_ids_size);
     float[3][8] sdfs;
 
     for (int edit_id = 0; edit_id < edit_list_size; edit_id++) {
@@ -522,14 +562,14 @@ void main() {
     }
 
     switch (pc.step) {
-        case DEFAULT_TWO_SURFACE_STEP:
-        if (material_ids_size == 2) {
-            process_default_two_surface_voxel(invocation_voxel_id, material_ids, sdfs);
-        }
-        break;
         case NON_DEFAULT_STEP:
         if (material_ids_size == 3) {
             process_non_default_voxel(invocation_voxel_id, material_ids, sdfs);
+        }
+        break;
+        case DEFAULT_TWO_SURFACE_STEP:
+        if (material_ids_size == 2 && is_default_mapping(invocation_voxel_id)) {
+            process_default_two_surface_voxel(invocation_voxel_id, material_ids, sdfs);
         }
         break;
     }

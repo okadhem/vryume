@@ -25,7 +25,7 @@ layout(
 set = 2,
 binding = 1,
 r8ui
-) uniform readonly uimage3D tile_voxel_material;
+) uniform readonly uimage3D material_info_image;
 
 layout(set = 2, binding = 2) uniform sampler3D sdf_packed_image;
 
@@ -259,90 +259,113 @@ void main() {
 
     uint material_id;
     {
-        //ivec3 voxel_id = ivec3(pc.tile_extent_voxels * ray_tip_norm);
-        //DEBUG(texel center)
         ivec3 voxel_id = ivec3((ray_tip - 0.5 * vec3(inter_sample_distance)) / vec3(inter_sample_distance));
-        uint material_info = imageLoad(tile_voxel_material, voxel_id).r;
 
-        // works a bit
+        uint material_id_mapping[3] = {
+                UNMAPPED_CHANNEL,
+                UNMAPPED_CHANNEL,
+                UNMAPPED_CHANNEL
+            };
 
-        if (material_info == NULL_VOXEL) {
-            vec3 material_sample_point = ray_tip - normal_tile * (distance + 0.0001);
-            vec3 material_sample_point_norm = material_sample_point / pc.tile_extent;
-            //voxel_id = ivec3(pc.tile_extent_voxels * material_sample_point_norm);
-            voxel_id = ivec3((material_sample_point - 0.5 * vec3(inter_sample_distance)) / vec3(inter_sample_distance));
-            material_info = imageLoad(tile_voxel_material, voxel_id).r;
-            if (material_info != NULL_VOXEL) {
-                //material_info = 0; // mark voxels that are fixed by this
+        uint deduplicated_materials[3];
+        int next_deduplicated_material = 0;
+
+        bool default_mapped_voxel = false;
+        for (int z = 0; z < 2; z++)
+            for (int y = 0; y < 2; y++)
+                for (int x = 0; x < 2; x++) {
+                    uint material_info = imageLoad(material_info_image, voxel_id + ivec3(x, y, z)).r;
+                    uint material_mapping_header = material_mapping_from_info(material_info);
+                    uint material_id = material_id_from_info(material_info);
+
+                    bool material_already_known = false;
+                    for (int i = 0; i < next_deduplicated_material; i++) {
+                        if (deduplicated_materials[i] == material_id) {
+                            material_already_known = true;
+                            break;
+                        }
+                    }
+                    if (!material_already_known) {
+                        deduplicated_materials[next_deduplicated_material] = material_id;
+                        next_deduplicated_material += 1;
+                    }
+
+                    switch (material_mapping_header) {
+                        case CHANNEL_1_MAPPING_HEADER:
+                        material_id_mapping[0] = material_id;
+                        break;
+                        case CHANNEL_2_MAPPING_HEADER:
+                        material_id_mapping[1] = material_id;
+                        break;
+                        case CHANNEL_3_MAPPING_HEADER:
+                        material_id_mapping[2] = material_id;
+                        break;
+                        case DEFAULT_MAPPING_HEADER:
+                        default_mapped_voxel = true;
+                        break;
+                    }
+                }
+
+        uint material_id_mapping_size = next_deduplicated_material;
+
+        if (default_mapped_voxel && material_id_mapping_size == 2) {
+            if (deduplicated_materials[0] < deduplicated_materials[1]) {
+                material_id_mapping[0] = deduplicated_materials[0];
+                material_id_mapping[1] = deduplicated_materials[1];
+            } else {
+                material_id_mapping[0] = deduplicated_materials[1];
+                material_id_mapping[1] = deduplicated_materials[0];
             }
         }
+        //TODO assert on other impossible cases
 
-        if ((material_info & HEADER_MASK) == ONE_SURFACE_VOXEL_HEADER) {
-            material_id = material_info & ~HEADER_MASK;
-        }
-        else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C12_CONFIG) {
+        float sampled_distances[2] = float[](0, 0);
+        if (material_id_mapping_size == 1) {
+            material_id = material_id_mapping[0];
+        } else if (material_id_mapping_size == 2) {
+            if (material_id_mapping[0] == UNMAPPED_CHANNEL) {
+                vec4 tex = texture(sdf_packed_image, ray_tip_norm);
+                sampled_distances[1] = decode_distance_4bits(tex.r);
+
+                if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
+                    material_id = material_id_mapping[1];
+                } else {
+                    material_id = material_id_mapping[2];
+                }
+            } else if (material_id_mapping[1] == UNMAPPED_CHANNEL) {
+                vec4 tex = texture(sdf_packed_image, ray_tip_norm);
+                sampled_distances[0] = decode_distance_4bits(tex.g);
+
+                if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
+                    material_id = material_id_mapping[0];
+                } else {
+                    material_id = material_id_mapping[2];
+                }
+            } else {
+                vec4 tex = texture(sdf_packed_image, ray_tip_norm);
+                sampled_distances[0] = decode_distance_4bits(tex.g);
+                sampled_distances[1] = decode_distance_4bits(tex.r);
+
+                if (sampled_distances[0] < sampled_distances[1]) {
+                    material_id = material_id_mapping[0];
+                } else {
+                    material_id = material_id_mapping[1];
+                }
+            }
+        } else if (material_id_mapping_size == 3) {
             vec4 tex = texture(sdf_packed_image, ray_tip_norm);
-            float sampled_distances[2];
             sampled_distances[0] = decode_distance_4bits(tex.g);
             sampled_distances[1] = decode_distance_4bits(tex.r);
 
-            uint material_ids[2] = read_2_surface_voxel_material_id(voxel_id);
-
-            // in this particular case, we can sort the two sampled distances and pick the smaller one
-            // it may give better results than the comparing to zero_distance_4bits
             if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
-                material_id = material_ids[0];
-                //material_id = 0;
-                //material_id = material_ids[1]; //DEBUG
+                material_id = material_id_mapping[0];
             } else if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
-                material_id = material_ids[1];
-                //material_id = 4;
-                //material_id = material_ids[0]; //DEBUG
-            }
-        }
-        else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C13_CONFIG) {
-            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
-            float sampled_distances[2];
-            sampled_distances[0] = decode_distance_4bits(tex.g);
-
-            uint material_ids[2] = read_2_surface_voxel_material_id(voxel_id);
-            if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
-                material_id = material_ids[0];
+                material_id = material_id_mapping[1];
             } else {
-                material_id = material_ids[1];
-            }
-        }
-        else if ((material_info & HEADER_TWO_SURFACE_CONFIG_MASK) == TWO_SURFACE_VOXEL_C23_CONFIG) {
-            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
-            float sampled_distances[2];
-            sampled_distances[1] = decode_distance_4bits(tex.r);
-
-            uint material_ids[2] = read_2_surface_voxel_material_id(voxel_id);
-            if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
-                material_id = material_ids[0];
-            } else {
-                material_id = material_ids[1];
-            }
-        }
-        else if ((material_info & HEADER_MASK) == THREE_SURFACE_VOXEL_HEADER) {
-            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
-            float sampled_distances[2];
-            sampled_distances[0] = decode_distance_4bits(tex.g);
-            sampled_distances[1] = decode_distance_4bits(tex.r);
-
-            uint material_ids[3] = read_3_surface_voxel_material_id(voxel_id);
-
-            if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
-                material_id = material_ids[0];
-            } else if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
-                material_id = material_ids[1];
-            } else {
-                material_id = material_ids[2];
+                material_id = material_id_mapping[2];
             }
         } else {
-            //TODO we could reserve a value for when voxel has no material info
-            //this should not happen, we should be at the surface of an object
-            //TODO report error
+            //TODO error, more than 3 materials not supported
         }
     }
 
@@ -365,9 +388,6 @@ void main() {
         break;
         case 4:
         object_color = vec3(0.0, 1.0, 1.0); // cyan
-        break;
-        case NULL_VOXEL:
-        object_color = vec3(0.0, 1.0, 0.0);
         break;
         default:
         object_color = vec3(0.9, 0.0, 1.0);

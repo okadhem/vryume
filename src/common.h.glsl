@@ -99,6 +99,31 @@ float evaluate_primitive(Edit edit, vec3 pos) {
     return 0;
 }
 
-uint default_material_info(uint material_id) {
-    //TODO
+// sort in ascending order
+void sort3(inout uint array[3])
+{
+    if (array[0] > array[1]) {
+        uint t = array[0];
+        array[0] = array[1];
+        array[1] = t;
+    }
+    if (array[1] > array[2]) {
+        uint t = array[1];
+        array[1] = array[2];
+        array[2] = t;
+    }
+    if (array[0] > array[1]) {
+        uint t = array[0];
+        array[0] = array[1];
+        array[1] = t;
+    }
+}
+
+// sort in assending order.
+void sort2(uint[2] a) {
+    if (a[0] > a[1]) {
+        uint t = a[0];
+        a[0] = a[1];
+        a[1] = t;
+    }
 }

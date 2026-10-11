@@ -13,17 +13,17 @@ const int NON_DEFAULT_STEP = 1; // depends on evaluation shader results (materia
 const int DEFAULT_TWO_SURFACE_STEP = 2; // depends on results from NON_DEFAULT_STEP
 // when this step is done, all two surface voxels with default mapping are encoded, sdfs are written.
 
-layout(set = 0, binding = 0, std140) uniform EditsUniformBuffer {
-    uint edit_list_size;
-    Edit edit_list[4];
-};
-
 layout(push_constant) uniform PushConstant {
     vec3 tile_pos; // in model space
     int step; // one of STEP_XXX, how many sub surface we should encode in this shader run. each step assumes the steps before are done.
     uint voxel_texture_width; // in number of voxels
     uint voxel_texture_height; // in number of voxels
 } pc;
+
+layout(set = 0, binding = 0, std140) uniform EditsUniformBuffer {
+    uint edit_list_size;
+    Edit edit_list[4];
+};
 
 layout(
 set = 0,
@@ -377,7 +377,7 @@ bool is_default_mapping(ivec3 voxel_id) {
         uint buffer_word_index = sample_buffer_index / 4;
         uint texel_offset_in_buffer_word = sample_buffer_index % 4; // in bytes
 
-        uint buffer_word = material_info_buf[buffer_word_index];
+        uint buffer_word = material_info_buf[buffer_word_index]; // we are assuming that we won't get tearing at the byte level
         uint material_info = (buffer_word >> (texel_offset_in_buffer_word * 8)) & 0xFFu;
         if (material_mapping_from_info(material_info) == DEFAULT_MAPPING_HEADER) {
             return true;

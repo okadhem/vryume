@@ -6,7 +6,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
 layout(push_constant) uniform PushConstant {
     vec3 tile_pos; // in model space
-} push_constant;
+    uint voxel_texture_width; // in number of voxels
+    uint voxel_texture_height; // in number of voxels
+} pc;
 
 layout(
 set = 0,
@@ -21,9 +23,10 @@ layout(set = 0, binding = 1, std140) uniform EditsUniformBuffer {
 
 layout(
 set = 0,
-binding = 2,
-r8ui
-) uniform uimage3D samples_material_info;
+binding = 2
+) buffer MaterialInfoBuffer {
+    coherent uint material_info_buf[];
+};
 
 #include "common.h.glsl"
 
@@ -51,12 +54,39 @@ float model_signed_distance(vec3 pos, out uint material_id) {
     return accumulated_distance;
 }
 
+// material_id_mapping is a mapping from channel to material_id
+void write_material_info(ivec3 sample_coord, uint material_info) {
+    uint width = pc.voxel_texture_width + 1;
+    uint height = pc.voxel_texture_height + 1;
+
+    uint sample_buffer_index = sample_coord.x + sample_coord.y * width + sample_coord.z * width * height; // index in texels
+
+    // we use atomic writes that require the location to be 4 byte aligned
+    uint atomic_word_index = sample_buffer_index / 4;
+    uint texel_offset_in_atomic_word = sample_buffer_index % 4; // in bytes
+
+    // CAS loop
+    for (; ; ) {
+        uint current_value = atomicAdd(material_info_buf[atomic_word_index], 0);
+        uint current_texel_value = (current_value >> (texel_offset_in_atomic_word * 8)) & 0xFFu;
+
+        uint shift = 8 * texel_offset_in_atomic_word;
+        uint mask = 0xFF << shift;
+        uint new_value = (current_value & ~mask) | (material_info << shift);
+
+        uint value_before_write = atomicCompSwap(material_info_buf[atomic_word_index], current_value, new_value);
+        if (value_before_write == current_value) {
+            break;
+        }
+    }
+}
+
 void main() {
     ivec3 invocation_id = ivec3(gl_GlobalInvocationID.xyz);
     //DEBUG (texel center)
-    vec3 sample_position = push_constant.tile_pos + invocation_id * inter_sample_distance + 0.5 * vec3(inter_sample_distance); // in model space
+    vec3 sample_position = pc.tile_pos + invocation_id * inter_sample_distance + 0.5 * vec3(inter_sample_distance); // in model space
     uint material_id;
     float encoded_distance = encode_distance(model_signed_distance(sample_position, material_id));
     imageStore(total_sdf, invocation_id, vec4(encoded_distance, 0, 0, 0));
-    imageStore(samples_material_info, invocation_id, uvec4(make_material_info(material_id, DEFAULT_MAPPING_HEADER), 0, 0, 0));
+    write_material_info(invocation_id, make_material_info(material_id, DEFAULT_MAPPING_HEADER));
 }

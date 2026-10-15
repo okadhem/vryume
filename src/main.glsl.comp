@@ -308,64 +308,68 @@ void main() {
 
         uint material_id_mapping_size = next_deduplicated_material;
 
-        if (default_mapped_voxel && material_id_mapping_size == 2) {
-            if (deduplicated_materials[0] < deduplicated_materials[1]) {
-                material_id_mapping[0] = deduplicated_materials[0];
-                material_id_mapping[1] = deduplicated_materials[1];
-            } else {
-                material_id_mapping[0] = deduplicated_materials[1];
-                material_id_mapping[1] = deduplicated_materials[0];
-            }
-        }
-        //TODO assert on other impossible cases
-
-        float sampled_distances[2] = float[](0, 0);
         if (material_id_mapping_size == 1) {
-            material_id = material_id_mapping[0];
-        } else if (material_id_mapping_size == 2) {
-            if (material_id_mapping[0] == UNMAPPED_CHANNEL) {
-                vec4 tex = texture(sdf_packed_image, ray_tip_norm);
-                sampled_distances[1] = decode_distance_4bits(tex.r);
-
-                if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
-                    material_id = material_id_mapping[1];
+            material_id = deduplicated_materials[0];
+        } else {
+            if (default_mapped_voxel && material_id_mapping_size == 2) {
+                if (deduplicated_materials[0] < deduplicated_materials[1]) {
+                    material_id_mapping[0] = deduplicated_materials[0];
+                    material_id_mapping[1] = deduplicated_materials[1];
                 } else {
-                    material_id = material_id_mapping[2];
+                    material_id_mapping[0] = deduplicated_materials[1];
+                    material_id_mapping[1] = deduplicated_materials[0];
                 }
-            } else if (material_id_mapping[1] == UNMAPPED_CHANNEL) {
+            }
+            //TODO assert on other impossible cases
+
+            float sampled_distances[2] = float[](0, 0);
+            if (material_id_mapping_size == 1) {
+                material_id = material_id_mapping[0];
+            } else if (material_id_mapping_size == 2) {
+                if (material_id_mapping[0] == UNMAPPED_CHANNEL) {
+                    vec4 tex = texture(sdf_packed_image, ray_tip_norm);
+                    sampled_distances[1] = decode_distance_4bits(tex.r);
+
+                    if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
+                        material_id = material_id_mapping[1];
+                    } else {
+                        material_id = material_id_mapping[2];
+                    }
+                } else if (material_id_mapping[1] == UNMAPPED_CHANNEL) {
+                    vec4 tex = texture(sdf_packed_image, ray_tip_norm);
+                    sampled_distances[0] = decode_distance_4bits(tex.g);
+
+                    if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
+                        material_id = material_id_mapping[0];
+                    } else {
+                        material_id = material_id_mapping[2];
+                    }
+                } else {
+                    vec4 tex = texture(sdf_packed_image, ray_tip_norm);
+                    sampled_distances[0] = decode_distance_4bits(tex.g);
+                    sampled_distances[1] = decode_distance_4bits(tex.r);
+
+                    if (sampled_distances[0] < sampled_distances[1]) {
+                        material_id = material_id_mapping[0];
+                    } else {
+                        material_id = material_id_mapping[1];
+                    }
+                }
+            } else if (material_id_mapping_size == 3) {
                 vec4 tex = texture(sdf_packed_image, ray_tip_norm);
                 sampled_distances[0] = decode_distance_4bits(tex.g);
+                sampled_distances[1] = decode_distance_4bits(tex.r);
 
                 if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
                     material_id = material_id_mapping[0];
+                } else if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
+                    material_id = material_id_mapping[1];
                 } else {
                     material_id = material_id_mapping[2];
                 }
             } else {
-                vec4 tex = texture(sdf_packed_image, ray_tip_norm);
-                sampled_distances[0] = decode_distance_4bits(tex.g);
-                sampled_distances[1] = decode_distance_4bits(tex.r);
-
-                if (sampled_distances[0] < sampled_distances[1]) {
-                    material_id = material_id_mapping[0];
-                } else {
-                    material_id = material_id_mapping[1];
-                }
+                //TODO error, more than 3 materials not supported
             }
-        } else if (material_id_mapping_size == 3) {
-            vec4 tex = texture(sdf_packed_image, ray_tip_norm);
-            sampled_distances[0] = decode_distance_4bits(tex.g);
-            sampled_distances[1] = decode_distance_4bits(tex.r);
-
-            if (abs(distance - sampled_distances[0]) <= zero_distance_4bits) {
-                material_id = material_id_mapping[0];
-            } else if (abs(distance - sampled_distances[1]) <= zero_distance_4bits) {
-                material_id = material_id_mapping[1];
-            } else {
-                material_id = material_id_mapping[2];
-            }
-        } else {
-            //TODO error, more than 3 materials not supported
         }
     }
 

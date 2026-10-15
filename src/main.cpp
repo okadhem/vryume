@@ -615,7 +615,7 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
 
   {
     evaluation_state.sdf_tile_image_extent = {
-        .width = 1000, .height = 1000, .depth = 1000};
+        .width = 784, .height = 784, .depth = 784};
 
     create_simple_image(
         SimpleImageCreateInfo{
@@ -626,10 +626,9 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
             .extent = evaluation_state.sdf_tile_image_extent,
             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
             .imageViewType = VK_IMAGE_VIEW_TYPE_3D,
-            .memoryTypeIndex = device_only_memory_type_index,
-        },
+            .memoryTypeIndex = device_only_memory_type_index},
         &evaluation_state.sdf_tile_image, &evaluation_state.sdf_tile_image_view,
-        &evaluation_state.material_info_image_memory);
+        &evaluation_state.sdf_tile_image_memory);
 
     create_simple_image(
         SimpleImageCreateInfo{
@@ -741,11 +740,7 @@ void initialize_evaluation_state(VkImageMemoryBarrier2 barriers[3]) {
             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            .memoryTypeIndex =
-                host_visible_memory_type_index, // only GPU will use this, yet
-                                                // we do this to get a page in
-                                                // RAM because of memory
-                                                // pressure
+            .memoryTypeIndex = device_only_memory_type_index,
         },
         &evaluation_state.material_info_buffer,
         &evaluation_state.material_info_buffer_memory,
@@ -2879,7 +2874,17 @@ extern "C" int engine_main(
                       VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_COMPUTE,
                       evaluation_state.sdf_pipeline);
 
-    EvaluationPushConstant evaluation_push_constant = {.tile_pos = {0, 0, 0}};
+    uint32 texture_voxel_width =
+        evaluation_state.sdf_tile_image_extent.width - 1;
+    uint32 texture_voxel_height =
+        evaluation_state.sdf_tile_image_extent.height - 1;
+    uint32 texture_voxel_depth =
+        evaluation_state.sdf_tile_image_extent.depth - 1;
+    EvaluationPushConstant evaluation_push_constant = {
+        .tile_pos = {0, 0, 0},
+        .voxel_texture_width = texture_voxel_width,
+        .voxel_texture_height = texture_voxel_height,
+    };
     vkCmdPushConstants(
         evaluation_commands, evaluation_state.sdf_pipeline_layout,
         VK_SHADER_STAGE_COMPUTE_BIT,

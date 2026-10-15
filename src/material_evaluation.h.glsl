@@ -18,18 +18,22 @@ const uint UNMAPPED_CHANNEL = UINT_MAX;
 uint make_material_info(uint material_id, uint channel_index) {
     switch (channel_index) {
         case 0:
-        return CHANNEL_1_MAPPING_HEADER & material_id;
+        return CHANNEL_1_MAPPING_HEADER | material_id;
         break;
         case 1:
-        return CHANNEL_2_MAPPING_HEADER & material_id;
+        return CHANNEL_2_MAPPING_HEADER | material_id;
         break;
         case 2:
-        return CHANNEL_3_MAPPING_HEADER & material_id;
+        return CHANNEL_3_MAPPING_HEADER | material_id;
         break;
         default:
         //panic
         return UINT_MAX;
     }
+}
+
+uint make_default_material_info(uint material_id) {
+    return DEFAULT_MAPPING_HEADER | material_id;
 }
 
 uint material_id_from_info(uint material_info) {

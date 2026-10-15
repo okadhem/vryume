@@ -88,5 +88,5 @@ void main() {
     uint material_id;
     float encoded_distance = encode_distance(model_signed_distance(sample_position, material_id));
     imageStore(total_sdf, invocation_id, vec4(encoded_distance, 0, 0, 0));
-    write_material_info(invocation_id, make_material_info(material_id, DEFAULT_MAPPING_HEADER));
+    write_material_info(invocation_id, make_default_material_info(material_id));
 }

@@ -536,6 +536,10 @@ void main() {
     uint material_ids[3] = read_material_ids_ordered(invocation_voxel_id, material_ids_size);
     float[3][8] sdfs;
 
+    for (int i = 0; i < 3; i++) {
+        sdfs[i] = float[8](MAX_FLOAT, MAX_FLOAT, MAX_FLOAT, MAX_FLOAT, MAX_FLOAT, MAX_FLOAT, MAX_FLOAT, MAX_FLOAT);
+    }
+
     for (int edit_id = 0; edit_id < edit_list_size; edit_id++) {
         Edit edit = edit_list[edit_id];
         int material_id_index_in_materials = -1;

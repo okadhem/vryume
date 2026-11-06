@@ -1,3 +1,5 @@
+#extension GL_EXT_debug_printf : enable
+
 // Each voxel material byte is made of a header and a payload:
 // header (2 bits): indicate the mapping of the material_id in payload, either explicitly, or mark it as "default" mapping
 // which is mapping of materials in voxels away from 3 surface voxels and their neighbours
@@ -8,7 +10,7 @@ const uint HEADER_MASK = 0xC0u; // 0b11000000u;
 const uint DEFAULT_MAPPING_HEADER = 0u;
 const uint CHANNEL_1_MAPPING_HEADER = 0x40u; //0b01000000
 const uint CHANNEL_2_MAPPING_HEADER = 0x80u; //0b10000000
-const uint CHANNEL_3_MAPPING_HEADER = 0x60u; //0b11000000
+const uint CHANNEL_3_MAPPING_HEADER = 0xC0u; //0b11000000
 
 // we represent a voxel's channel to surface mapping with a 3 element uint array, where element 0 is
 // the surface mapped to the first channel, etc ..

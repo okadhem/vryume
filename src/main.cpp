@@ -1892,9 +1892,10 @@ extern "C" int engine_main(
     VkDebugUtilsMessengerCreateInfoEXT createInfo = {
         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
         .flags = 0,
-        .messageSeverity = // VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
-                           // VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
 
         .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
@@ -1977,14 +1978,15 @@ extern "C" int engine_main(
         .synchronization2 = VK_TRUE};
 
     const char *device_extensions[] = {"VK_KHR_swapchain",
-                                       "VK_KHR_synchronization2"};
+                                       "VK_KHR_synchronization2",
+                                       "VK_KHR_shader_non_semantic_info"};
 
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &sync2_features,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qci,
-        .enabledExtensionCount = 2,
+        .enabledExtensionCount = 3,
         .ppEnabledExtensionNames = device_extensions,
     };
 
@@ -2819,7 +2821,7 @@ extern "C" int engine_main(
   {
 
     if (renderdoc_api) {
-      // renderdoc_api->StartFrameCapture(NULL, NULL);
+      renderdoc_api->StartFrameCapture(NULL, NULL);
     }
 
     CHECK_VK(vkResetCommandPool(vkDevice, command_pool, 0));
@@ -3179,7 +3181,7 @@ extern "C" int engine_main(
     vkQueueWaitIdle(vkQueue);
 
     if (renderdoc_api) {
-      // renderdoc_api->EndFrameCapture(NULL, NULL);
+      renderdoc_api->EndFrameCapture(NULL, NULL);
     }
   }
 

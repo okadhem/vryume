@@ -1,4 +1,6 @@
 #version 450
+#extension GL_EXT_debug_printf : enable
+
 // this shader runs per voxel, we identify a voxel with its low x,y,z corner.
 
 // TODO this layout dimensions are bad, they are too big, but its a hack as it divides the total dispatch_dim
@@ -161,6 +163,9 @@ void write_material_id_mapping(ivec3 voxel_id, uint[3] material_id_mapping) {
             if (new_material_info == UINT_MAX) {
                 // TODO report an error
                 return;
+            }
+            if ((new_material_info & (~HEADER_MASK)) != (current_texel_value & (~HEADER_MASK))) {
+                debugPrintfEXT("error we should not change materials, only mapping" );
             }
 
             uint shift = 8 * texel_offset_in_atomic_word;
